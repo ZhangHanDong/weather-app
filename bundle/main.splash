@@ -27,6 +27,27 @@ let results = []
 let searching = false
 let search_note = ""
 
+// ---------- 守护页状态(S2:规则版,无 agent) ----------
+let g_screen = "home"            // home | guard
+let g_input = ""                 // 一句话原文
+let g_place = ""                 // 解析卡:地点标签
+let g_date = ""                  // YYYY-MM-DD(按当前城市时区)
+let g_start = "09:00"            // HH:MM
+let g_dur = 120                  // 分钟
+let g_stage = 0                  // 0输入 1解析卡 2风险+方案 3已执行
+let g_note = "输入一句话计划,开始守护"
+let g_risk_level = ""            // 低|中|高|""
+let g_risk_line = ""             // 触发因子摘要(每个数字带时间)
+let g_risk_src = ""              // 数据时间标注
+let g_facts_ok = false           // 计划窗内取到事实
+let g_no_forecast = ""           // 超窗提示(非空时不显示风险卡)
+let g_opts = []                  // [{id,act,label,why}]
+let g_sel = 0
+let g_plans = []                 // 行程簿
+let g_ledger = []                // 执行台账
+let g_last_action_id = ""        // 幂等判重键
+let g_verify_line = ""
+
 // ---------- 工具 ----------
 
 // 缺字段访问是错误而不是 nil(Gotchas):先数键再取值。
@@ -154,7 +175,7 @@ fn fetch(url){
 fn forecast_url(c){
     return "https://api.open-meteo.com/v1/forecast?latitude=" + c.lat + "&longitude=" + c.lon
         + "&current=temperature_2m,weather_code"
-        + "&hourly=temperature_2m,precipitation_probability"
+        + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
         + "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
         + "&timezone=auto&forecast_days=10"
 }
@@ -174,23 +195,38 @@ fn parse_forecast(body){
     if !has_key(data, "current") { return nil }
     let ctm = data.current.time
     if ctm == nil { return nil }
-    let hours = []
+    let hall = []
     if has_key(data, "hourly") && has_key(data.hourly, "time") {
         let ht = data.hourly.time
-        let prefix = hour_prefix(ctm)
-        let start = 0
-        if prefix != "" {
-            for i in ht.len() {
-                if ht[i].search(prefix) == 0 { start = i break }
-            }
-        }
-        for k in 24 {
-            let j = start + k
-            if j >= ht.len() { break }
+        for j in ht.len() {
             let pt = ht[j].split("T")
             let hh = ""
             if pt.len() >= 2 { hh = pt[1].split(":")[0] }
-            hours.push({h: hh t: data.hourly.temperature_2m[j] p: data.hourly.precipitation_probability[j]})
+            let pr = nil
+            if has_key(data.hourly, "precipitation") { pr = data.hourly.precipitation[j] }
+            let ap = nil
+            if has_key(data.hourly, "apparent_temperature") { ap = data.hourly.apparent_temperature[j] }
+            let ws = nil
+            if has_key(data.hourly, "wind_speed_10m") { ws = data.hourly.wind_speed_10m[j] }
+            let uv = nil
+            if has_key(data.hourly, "uv_index") { uv = data.hourly.uv_index[j] }
+            hall.push({ds: pt[0] h: hh t: data.hourly.temperature_2m[j] p: data.hourly.precipitation_probability[j] pr: pr ap: ap ws: ws uv: uv})
+        }
+    }
+    let hours = []
+    let prefix = hour_prefix(ctm)
+    let start = -1
+    if prefix != "" {
+        for i in hall.len() {
+            if hall[i].ds + "T" + hall[i].h + ":" == prefix { start = i break }
+        }
+    }
+    if start < 0 && hall.len() > 0 { start = 0 }
+    if start >= 0 {
+        for k in 24 {
+            let j = start + k
+            if j >= hall.len() { break }
+            hours.push({h: hall[j].h t: hall[j].t p: hall[j].p})
         }
     }
     let days = []
@@ -204,7 +240,7 @@ fn parse_forecast(body){
     let hi = nil
     let lo = nil
     if days.len() > 0 { hi = days[0].hi lo = days[0].lo }
-    return {temp: data.current.temperature_2m code: data.current.weather_code time: ctm hi: hi lo: lo hours: hours days: days}
+    return {temp: data.current.temperature_2m code: data.current.weather_code time: ctm hi: hi lo: lo hours: hours hall: hall days: days}
 }
 
 // 15 秒超时:到点仍无响应 → 作废这轮,保留上次成功数据并提示
@@ -264,6 +300,14 @@ fn render_home(){
         ui.hilo_lbl.set_text("最高 " + deg(wx.hi) + " · 最低 " + deg(wx.lo))
     }
     ui.note_lbl.set_text(note)
+    if wx == nil {
+        ui.hours_hdr.set_text("未来 24 小时 · 数据来自 Open-Meteo")
+        ui.days_hdr.set_text("10 天预报 · 数据来自 Open-Meteo")
+    } else {
+        let stamp = " · 数据时间 " + fmt_dt(wx.time)
+        ui.hours_hdr.set_text("未来 24 小时 · 数据来自 Open-Meteo" + stamp)
+        ui.days_hdr.set_text("10 天预报 · 数据来自 Open-Meteo" + stamp)
+    }
     ui.hours_strip.render()
     ui.days_list.render()
 }
@@ -383,6 +427,704 @@ fn select_city(i){
     refresh()
 }
 
+// ---------- 守护页:日期/星期计算 ----------
+
+// 今日(当地)= 当前天气数据时间的日期(timezone=auto,已是当地)
+fn today_str(){
+    if wx == nil { return "" }
+    return wx.time.split("T")[0]
+}
+
+fn days_of(ds){
+    let p = ds.split("-")
+    let y = p[0].to_f64()
+    let m = p[1].to_f64()
+    let d = p[2].to_f64()
+    let yy = y
+    let mm = m
+    if mm <= 2 { yy = y - 1 mm = m + 12 }
+    let era = floor(yy / 400.0)
+    let yoe = yy - era * 400.0
+    let doy = floor((153.0 * (mm - 3.0) + 2.0) / 5.0) + d - 1.0
+    let doe = yoe * 365.0 + floor(yoe / 4.0) - floor(yoe / 100.0) + doy
+    return era * 146097.0 + doe - 719468.0
+}
+
+fn wd_of(ds){
+    let days = days_of(ds)
+    let wd = days - floor(days / 7.0) * 7.0
+    let wi = wd + 4.0
+    wi = wi - floor(wi / 7.0) * 7.0
+    return wi
+}
+
+fn next_date(ds){
+    let days = days_of(ds) + 1.0
+    let z = days + 719468.0
+    let era = floor(z / 146097.0)
+    let doe = z - era * 146097.0
+    let yoe = floor((doe - floor(doe/1460.0) + floor(doe/36524.0) - floor(doe/146096.0)) / 365.0)
+    let y = yoe + era * 400.0
+    let doy = doe - (365.0*yoe + floor(yoe/4.0) - floor(yoe/100.0))
+    let mp = floor((5.0*doy + 2.0) / 153.0)
+    let d = doy - floor((153.0*mp + 2.0)/5.0) + 1.0
+    let m = mp + 3.0
+    if mp >= 10 { m = mp - 9.0 }
+    if m <= 2 { return fmt_ds(y + 1.0, m, d) }
+    return fmt_ds(y, m, d)
+}
+
+fn fmt_ds(y, m, d){
+    let ms = "" + round(m)
+    let ds = "" + round(d)
+    let ys = "" + round(y)
+    if m < 10.0 { ms = "0" + ms }
+    if d < 10.0 { ds = "0" + ds }
+    return ys + "-" + ms + "-" + ds
+}
+
+// ---------- 守护页:本地规则解析 ----------
+// 日期:今天/明天/后天/周X/M月D日/M/D;时间:上午/下午/晚上 N点[半]/HH:MM;
+// 时长:N小时/半天(默认120);地点:「去…」到下一个动词前的片段。
+fn g_parse(){
+    let text = g_input.trim()
+    if text == "" { g_note = "先输入一句话,例如:周六上午 9 点去深圳湾骑车" return }
+    let today = today_str()
+    if today == "" { g_note = "天气数据还没就绪,稍等再试" return }
+    let pdate = ""
+    // 相对日
+    if text.search("后天") >= 0 { pdate = shift_date(today, 2) }
+    elif text.search("明天") >= 0 { pdate = shift_date(today, 1) }
+    elif text.search("今天") >= 0 { pdate = today }
+    // 周X
+    if pdate == "" {
+        let names = ["周日","周一","周二","周三","周四","周五","周六"]
+        let alt = ["星期日","星期一","星期二","星期三","星期四","星期五","星期六"]
+        let want = -1
+        for i in 7 {
+            if text.search(names[i]) >= 0 { want = i break }
+        }
+        if want < 0 {
+            for i in 7 {
+                if text.search(alt[i]) >= 0 { want = i break }
+            }
+        }
+        if want >= 0 {
+            let cur_wd = wd_of(today)
+            let d = want - cur_wd
+            if d <= 0 { d = d + 7 }
+            pdate = shift_date(today, d)
+        }
+    }
+    // M月D日 / M/D(按今年;9/29 → 2026-09-29)
+    if pdate == "" {
+        let m = match_num_cn(text, "月")
+        if m >= 1 {
+            let d = match_day_after(text)
+            if d >= 1 { pdate = fmt_ds(year_of(today), m, d + 0.0) }
+        }
+    }
+    if pdate == "" {
+        let md = match_slash(text)
+        if md != nil { pdate = fmt_ds(year_of(today), md[0], md[1]) }
+    }
+    if pdate == "" { pdate = today }
+    // 时间
+    let hh = 9
+    let mm = 0
+    let t_found = false
+    let t24 = parse_hhmm(text)
+    if t24 != nil { hh = t24[0] mm = t24[1] t_found = true }
+    else {
+        let h12 = parse_cn_hour(text)
+        if h12 != nil { hh = h12[0] mm = h12[1] t_found = true }
+    }
+    if hh > 23 { hh = 9 }
+    // 时长
+    let dur = 120
+    let du = parse_dur(text)
+    if du > 0 { dur = du }
+    g_place = parse_place(text)
+    g_date = pdate
+    g_start = fmt_hm(hh + 0.0, mm + 0.0)
+    g_dur = dur
+    g_stage = 1
+    g_no_forecast = ""
+    g_verify_line = ""
+    // 缺项提示(#24):解析卡就是补全入口,note 点名缺什么。
+    let missing = []
+    if g_place == "" { missing.push("地点") }
+    if !t_found { missing.push("时间") }
+    if missing.len() > 0 {
+        g_note = "已解析,但缺:" + join_list(missing) + " · 请在解析卡补全后再评估"
+    } else {
+        g_note = "已解析(本地规则)· 按「评估风险」继续"
+    }
+    render_guard()
+}
+
+fn year_of(ds){ return ds.split("-")[0].to_f64() }
+
+fn shift_date(ds, n){
+    let out = ds
+    for i in n { out = next_date(out) }
+    return out
+}
+
+fn fmt_hm(h, m){
+    let hs = "" + round(h)
+    let ms = "" + round(m)
+    if h < 10.0 { hs = "0" + hs }
+    if m < 10.0 { ms = "0" + ms }
+    return hs + ":" + ms
+}
+
+// "9 点/9:30/09:00" → {h,m};上下午前缀换算
+fn parse_hhmm(text){
+    let t = text
+    let pm = t.search("下午") >= 0 || t.search("晚上") >= 0 || t.search("傍晚") >= 0
+    let rg = regex("([0-9]{1,2})[:点时]([0-9]{2})", "")
+    let m = rg.exec(t)
+    if m != nil && m.captures.len() >= 3 {
+        let h = m.captures[1].to_f64()
+        let mi = m.captures[2].to_f64()
+        if pm && h < 12.0 { h = h + 12.0 }
+        if h >= 24.0 { return nil }
+        return [h, mi]
+    }
+    let rg2 = regex("([0-9]{1,2}) *[:点时]", "")
+    let m2 = rg2.exec(t)
+    if m2 != nil && m2.captures.len() >= 2 {
+        let h = m2.captures[1].to_f64()
+        if pm && h < 12.0 { h = h + 12.0 }
+        if h >= 24.0 { return nil }
+        return [h, 0.0]
+    }
+    return nil
+}
+
+// 「九点」「上午九点」中文数字 1-12 + 可选「半」
+fn parse_cn_hour(text){
+    let t = text
+    let pm = t.search("下午") >= 0 || t.search("晚上") >= 0 || t.search("傍晚") >= 0
+    let cands = [["一",1.0],["二",2.0],["两",2.0],["三",3.0],["四",4.0],["五",5.0],["六",6.0],["七",7.0],["八",8.0],["九",9.0],["十",2.0]]
+    for c in cands {
+        let idx = t.search(c[0] + "点")
+        if idx >= 0 {
+            let h = c[1]
+            if c[0] == "十" { h = 10.0 }
+            if pm && h < 12.0 { h = h + 12.0 }
+            if h >= 24.0 { return nil }
+            if t.search("半") >= 0 && t.search("半") - idx < 4 { return [h, 30.0] }
+            return [h, 0.0]
+        }
+    }
+    return nil
+}
+
+// 中文数字月:M月;日:D日/D 号
+fn match_num_cn(text, suffix){
+    let cands = [["一",1.0],["二",2.0],["三",3.0],["四",4.0],["五",5.0],["六",6.0],["七",7.0],["八",8.0],["九",9.0],["十",10.0],["十一",11.0],["十二",12.0]]
+    let i = text.search(suffix)
+    if i < 0 { return -1 }
+    let head = text.split(suffix)[0]
+    for c in cands {
+        if head.search(c[0] + suffix) >= 0 { return c[1] }
+    }
+    // 阿拉伯数字
+    let m = regex("([0-9]{1,2})月", "").exec(text)
+    if m != nil && m.captures.len() >= 2 { return m.captures[1].to_f64() }
+    return -1
+}
+
+fn match_day_after(text){
+    let m = regex("([0-9]{1,2}) *[日号]", "").exec(text)
+    if m != nil && m.captures.len() >= 2 { return m.captures[1].to_f64() }
+    let cands = [["一",1.0],["二",2.0],["三",3.0],["四",4.0],["五",5.0],["六",6.0],["七",7.0],["八",8.0],["九",9.0],["三十",30.0],["二十",20.0],["十",10.0]]
+    for c in cands {
+        if text.search(c[0] + "日") >= 0 || text.search(c[0] + "号") >= 0 { return c[1] }
+    }
+    return -1
+}
+
+fn match_slash(text){
+    let m = regex("([0-9]{1,2})/([0-9]{1,2})", "").exec(text)
+    if m != nil && m.captures.len() >= 3 {
+        let mo = m.captures[1].to_f64()
+        let d = m.captures[2].to_f64()
+        if mo >= 1.0 && mo <= 12.0 && d >= 1.0 && d <= 31.0 { return [mo, d] }
+    }
+    return nil
+}
+
+fn parse_dur(text){
+    let m = regex("([0-9]{1,2}) *个?小时", "").exec(text)
+    if m != nil && m.captures.len() >= 2 {
+        let h = m.captures[1].to_f64()
+        if h >= 1.0 && h <= 12.0 { return round(h * 60.0) }
+    }
+    if text.search("两小时") >= 0 || text.search("两个小时") >= 0 { return 120 }
+    if text.search("半天") >= 0 { return 240 }
+    if text.search("半小时") >= 0 { return 30 }
+    let mc = regex("([0-9]{1,2}) *分钟", "").exec(text)
+    if mc != nil && mc.captures.len() >= 2 {
+        let v = mc.captures[1].to_f64()
+        if v >= 15.0 { return round(v) }
+    }
+    return 0
+}
+
+// 地点:「去<place>」到 骑车/爬山/跑步/露营/野餐/散步/拍照/看日出/看日落 或句尾
+fn parse_place(text){
+    let i = text.search("去")
+    if i < 0 { return "" }
+    // 「去」之后到第一个活动词/句尾
+    let stops = ["骑车","骑行","爬山","跑步","露营","野餐","散步","拍照","看日出","看日落","玩水","玩","钓鱼","徒步"]
+    let tail = text
+    for st in stops {
+        let m = regex("去([一-龥A-Za-z0-9]+)" + st, "").exec(text)
+        if m != nil && m.captures.len() >= 2 { tail = m.captures[1] break }
+    }
+    if tail == text {
+        let m2 = regex("去([一-龥A-Za-z0-9]+)", "").exec(text)
+        if m2 != nil && m2.captures.len() >= 2 { tail = m2.captures[1] }
+    }
+    return tail.trim()
+}
+
+// ---------- 守护页:事实与风险 ----------
+// 阈值出处:Rust 版 src/guardian_g2.rs:178-188 THRESHOLDS
+//   降水概率 ≥60 高 / 30-59 中;小时降水量 ≥2 高 / 0.5-1.9 中;
+//   体感 ≥35 或 ≤0 高 / 32-34.9 中;风速(户外) ≥38 高 / 28-37 中;UV ≥8 中。
+fn g_assess(){
+    if wx == nil { g_note = "天气数据还没就绪,稍等再试" render_guard() return }
+    let hall = wx.hall
+    if hall.len() == 0 { g_note = "逐小时数据不可用,稍后再试" render_guard() return }
+    // 窗口小时(start 的 HH,含 start 整点,共 ceil(dur/60)+1 个采样)
+    let sh = g_start.split(":")[0].to_f64()
+    let span = ceil(g_dur / 60.0)
+    let rows = []
+    for k in span + 1 {
+        let h = sh + k
+        if h > 23 { break }
+        for r in hall {
+            if r.ds == g_date && r.h.to_f64() == h { rows.push(r) break }
+        }
+    }
+    if rows.len() == 0 {
+        // 该日期无逐小时数据 → 超窗(预报只到今天+15 天)
+        g_no_forecast = gap_days_str(g_date) + " 后的天气还没有可靠预报"
+        g_risk_level = ""
+        g_risk_line = ""
+        g_opts = []
+        g_stage = 1
+        g_note = "超出预报范围,可改日期后重新评估"
+        render_guard()
+        return
+    }
+    g_no_forecast = ""
+    // 逐因子取窗内最差值(时间点带在括号里)
+    let pp_w = worst_row(rows, "p")
+    let pr_w = worst_row(rows, "pr")
+    let ap_w = worst_row(rows, "ap")
+    let ws_w = worst_row(rows, "ws")
+    let uv_w = worst_row(rows, "uv")
+    let hits = []
+    let level = "低"
+    if pp_w != nil && pp_w.v >= 60.0 { level = "高" hits.push("降水概率") }
+    elif pp_w != nil && pp_w.v >= 30.0 { level = "中" hits.push("降水概率") }
+    if pr_w != nil && pr_w.v >= 2.0 { level = "高" hits.push("小时降水量") }
+    elif pr_w != nil && pr_w.v >= 0.5 { level = "中" hits.push("小时降水量") }
+    if ap_w != nil && (ap_w.v >= 35.0 || ap_w.v <= 0.0) { level = "高" hits.push("体感温度") }
+    elif ap_w != nil && ap_w.v >= 32.0 { level = "中" hits.push("体感温度") }
+    if ws_w != nil && ws_w.v >= 38.0 { level = "高" hits.push("风速") }
+    elif ws_w != nil && ws_w.v >= 28.0 { level = "中" hits.push("风速") }
+    if uv_w != nil && uv_w.v >= 8.0 { if level == "低" { level = "中" } hits.push("UV指数") }
+    g_risk_level = level
+    g_risk_line = hit_line(rows, hits)
+    g_risk_src = "Open-Meteo · 数据时间 " + fmt_dt(wx.time)
+    g_facts_ok = true
+    build_options(level, hits, pp_w, pr_w, ap_w, uv_w)
+    g_stage = 2
+    g_note = "风险:" + level + " · 按〈" + cities[cur].name + "〉的预报"
+    render_guard()
+}
+
+// rows 里某字段的最差(最大)值
+fn worst_row(rows, key){
+    // hall rows are script literals: has_key (key iteration) does not see
+    // their keys (PROBE1-3, board #24); dispatch on key name instead.
+    let best = nil
+    for r in rows {
+        let v = nil
+        if key == "p" { if r.p != nil { v = r.p } }
+        if key == "pr" { if r.pr != nil { v = r.pr } }
+        if key == "ap" { if r.ap != nil { v = r.ap } }
+        if key == "ws" { if r.ws != nil { v = r.ws } }
+        if key == "uv" { if r.uv != nil { v = r.uv } }
+        if v != nil {
+            if best == nil || v > best.v { best = {k: key v: v h: r.h} }
+        }
+    }
+    return best
+}
+
+fn hit_line(rows, hits){
+    if hits.len() == 0 { return "计划时段未触发风险规则" }
+    let parts = []
+    for h in hits {
+        if h == "降水概率" { let w = worst_row(rows, "p") if w != nil { parts.push("降水概率 " + int_str(w.v) + "%(" + w.h + ":00)") } }
+        if h == "小时降水量" { let w = worst_row(rows, "pr") if w != nil { parts.push("小时降水量 " + w.v + " 毫米(" + w.h + ":00)") } }
+        if h == "体感温度" { let w = worst_row(rows, "ap") if w != nil { parts.push("体感温度 " + w.v + "°C(" + w.h + ":00)") } }
+        if h == "风速" { let w = worst_row(rows, "ws") if w != nil { parts.push("风速 " + w.v + " 公里/时(" + w.h + ":00)") } }
+        if h == "UV指数" { let w = worst_row(rows, "uv") if w != nil { parts.push("UV指数 " + w.v + "(" + w.h + ":00)") } }
+    }
+    let out = parts[0]
+    for i in parts.len() {
+        if i > 0 { out = out + "、" + parts[i] }
+    }
+    return out
+}
+
+fn gap_days_str(ds){
+    let t = today_str()
+    let gap = days_of(ds) - days_of(t)
+    return "" + round(gap) + " 天"
+}
+
+// ---------- 守护页:规则方案 ----------
+// 映射自 Rust 版 rule_fallback_with_next_day(guardian_g2.rs:404-470):
+// 高 → A改期(需次日同窗非高) + B室内;中 → A携带(词表内) + B室内;
+// 低 → A保持原计划。
+fn build_options(level, hits, pp_w, pr_w, ap_w, uv_w){
+    let opts = []
+    let cite = g_risk_line
+    if level == "高" {
+        // #24: 改期 = 最近几天同一时段里首个风险更低的日子(扫 5 天)
+        let next = ""
+        for i in 5 {
+            let cand = shift_date(g_date, i + 1)
+            if day_level(cand) != "高" { next = cand break }
+        }
+        let next_ok = next != ""
+        if next_ok {
+            opts.push({id: "A" act: "reschedule" label: "改期到 " + short_date(next) + " " + g_start why: "高风险。新时段 " + short_date(next) + ": " + day_line(next) + "; " + cite})
+        }
+        opts.push({id: (if opts.len() == 0 {"A"} else {"B"}) act: "mark_indoor" label: "改为室内" why: "高风险:触发 " + join_hits(hits) + "; 改为室内。" + cite})
+    }
+    elif level == "中" {
+        let carry = []
+        for h in hits {
+            if h == "降水概率" || h == "小时降水量" { if !in_list(carry, "雨具") { carry.push("雨具") } }
+            if h == "体感温度" && ap_w != nil && ap_w.v >= 32.0 { if !in_list(carry, "补水") { carry.push("补水") } }
+            if h == "体感温度" && ap_w != nil && ap_w.v <= 0.0 { if !in_list(carry, "保暖衣物") { carry.push("保暖衣物") } }
+            if h == "UV指数" { if !in_list(carry, "防晒") { carry.push("防晒") } }
+        }
+        if carry.len() > 0 {
+            let note = join_list(carry)
+            opts.push({id: "A" act: "add_checklist" label: "携带:" + note why: "中风险:触发 " + join_hits(hits) + "; 建议携带。" + cite})
+        }
+        opts.push({id: (if opts.len() == 0 {"A"} else {"B"}) act: "mark_indoor" label: "改为室内" why: "中风险:触发 " + join_hits(hits) + "; 可改为室内。" + cite})
+    }
+    else {
+        opts.push({id: "A" act: "keep" label: "保持原计划" why: "低风险:" + cite})
+    }
+    g_opts = opts
+    g_sel = 0
+}
+
+// 某日期同窗(仅按小时,跨天不折返)的风险等级
+fn day_level(ds){
+    let hall = wx.hall
+    let sh = g_start.split(":")[0].to_f64()
+    let span = ceil(g_dur / 60.0)
+    let lv = "低"
+    for k in span + 1 {
+        let h = sh + k
+        if h > 23 { break }
+        for r in hall {
+            if r.ds == ds && r.h.to_f64() == h {
+                if r.p != nil && r.p >= 60.0 { lv = "高" }
+                elif r.p != nil && r.p >= 30.0 { if lv == "低" { lv = "中" } }
+                if r.pr != nil && r.pr >= 2.0 { lv = "高" }
+                elif r.pr != nil && r.pr >= 0.5 { if lv == "低" { lv = "中" } }
+                if r.ap != nil && (r.ap >= 35.0 || r.ap <= 0.0) { lv = "高" }
+                elif r.ap != nil && r.ap >= 32.0 { if lv == "低" { lv = "中" } }
+                if r.ws != nil && r.ws >= 38.0 { lv = "高" }
+                elif r.ws != nil && r.ws >= 28.0 { if lv == "低" { lv = "中" } }
+                break
+            }
+        }
+    }
+    return lv
+}
+
+fn day_line(ds){
+    let hall = wx.hall
+    let sh = g_start.split(":")[0].to_f64()
+    let span = ceil(g_dur / 60.0)
+    let mpp = nil
+    for k in span + 1 {
+        let h = sh + k
+        if h > 23 { break }
+        for r in hall {
+            if r.ds == ds && r.h.to_f64() == h {
+                if r.p != nil {
+                    if mpp == nil || r.p > mpp { mpp = r.p }
+                }
+                break
+            }
+        }
+    }
+    if mpp == nil { return "暂无该时段数据" }
+    return "降水概率 " + int_str(mpp) + "%,风险" + day_level(ds)
+}
+
+fn in_list(list, v){
+    for x in list { if x == v { return true } }
+    return false
+}
+
+fn join_hits(hits){
+    if hits.len() == 0 { return "无" }
+    let out = hits[0]
+    for i in hits.len() { if i > 0 { out = out + "、" + hits[i] } }
+    return out
+}
+
+fn join_list(list){
+    let out = list[0]
+    for i in list.len() { if i > 0 { out = out + "、" + list[i] } }
+    return out
+}
+
+// ---------- 守护页:确认执行 / 幂等 / 核验 ----------
+
+fn load_plans(){
+    g_plans = []
+    g_ledger = []
+    if fs.exists("plans.json") {
+        let v = fs.read("plans.json").parse_json()
+        if v != nil && has_key(v, "list") { g_plans = v.list }
+    }
+    if fs.exists("ledger.json") {
+        let v2 = fs.read("ledger.json").parse_json()
+        if v2 != nil && has_key(v2, "entries") { g_ledger = v2.entries }
+    }
+}
+
+fn save_plans(){ fs.write("plans.json", {list: g_plans}.to_json()) }
+fn save_ledger(){ fs.write("ledger.json", {entries: g_ledger}.to_json()) }
+
+fn ledger_seq(){
+    if g_ledger.len() == 0 { return 1 }
+    let mx = 0
+    for e in g_ledger { if e.seq > mx { mx = e.seq } }
+    return mx + 1
+}
+
+// 执行动作(不经过任何模型):直接改行程簿条目
+fn apply_action(plan, opt){
+    if opt.act == "reschedule" {
+        plan = redate_plan(plan, opt)
+    }
+    elif opt.act == "mark_indoor" { plan.indoor = true }
+    elif opt.act == "add_checklist" {
+        let items = opt.label.split(":")
+        if items.len() >= 2 {
+            let its = items[1].split("、")
+            for it in its {
+                let t = it.trim()
+                if t != "" && !in_list(plan.checklist, t) { plan.checklist.push(t) }
+            }
+        }
+    }
+    return plan
+}
+
+fn redate_plan(plan, opt){
+    // label 形如「改期到 10/3 周六 09:00」→ 从 short_date 反解
+    let m = regex("([0-9]{1,2})/([0-9]{1,2})", "").exec(opt.label)
+    if m != nil && m.captures.len() >= 3 {
+        let mo = m.captures[1].to_f64()
+        let d = m.captures[2].to_f64()
+        let y = year_of(today_str())
+        // short_date 无年份:跨年时按预报窗口归属(10/3 → 当年)
+        plan.date = fmt_ds(y, mo, d)
+    }
+    return plan
+}
+
+fn g_confirm(){
+    // 幂等:同一方案(action 键)再确认 → 不重复执行。stage 已是 3 时
+    // 也要回答「未重复」而不是静默 return(#24 验收点)。
+    if (g_stage != 2 && g_stage != 3) || g_opts.len() == 0 { return }
+    let opt = g_opts[g_sel]
+    let act_id = plan_key(opt)
+    if act_id == g_last_action_id {
+        g_note = "已执行,未重复"
+        render_guard()
+        return
+    }
+    if g_stage != 2 { return }
+    let plan = {id: "p" + time_now() place: g_place date: g_date start: g_start dur: g_dur indoor: false checklist: [] done: false}
+    let before = g_date + " " + g_start
+    let after = apply_action(plan, opt)
+    g_plans.push(after)
+    save_plans()
+    let seq = ledger_seq()
+    g_ledger.push({seq: seq at: fmt_dt(wx.time) kind: "exec" action_id: act_id detail: opt.label + " → 已应用;执行前 " + g_date + " " + g_start + " · 户外"})
+    save_ledger()
+    g_last_action_id = act_id
+    g_stage = 3
+    g_note = "已执行(台账 #" + seq + ")· 按「核验」重新取数比对"
+    render_guard()
+}
+
+fn plan_key(opt){
+    return opt.act + ":" + g_date + ":" + g_start + ":" + g_dur + ":" + opt.label
+}
+
+// 核验:重新拉取当前城市预报,读回行程簿最后一条,比对 + 改期新窗非高
+fn g_verify(){
+    if g_stage != 3 { return }
+    if wx == nil { g_note = "数据未就绪" render_guard() return }
+    let p = g_plans[g_plans.len()-1]
+    let lv = day_level_of(p.date, p.start, p.dur)
+    let readback = p.place + " " + short_date(p.date) + " " + p.start
+    if p.indoor {
+        g_verify_line = "核验通过 · 读回 " + readback + " · 室内"
+        g_note = "核验通过"
+    }
+    elif lv == "高" {
+        g_verify_line = "核验未通过 · 读回 " + readback + " · 新时段风险高"
+        g_note = "核验未通过,可重选方案"
+    }
+    else {
+        g_verify_line = "核验通过 · 读回 " + readback + " · 新时段风险" + lv
+        g_note = "核验通过"
+    }
+    render_guard()
+}
+
+fn day_level_of(ds, start, dur){
+    let hall = wx.hall
+    let sh = start.split(":")[0].to_f64()
+    let span = ceil(dur / 60.0)
+    let lv = "低"
+    for k in span + 1 {
+        let h = sh + k
+        if h > 23 { break }
+        for r in hall {
+            if r.ds == ds && r.h.to_f64() == h {
+                if r.p != nil && r.p >= 60.0 { lv = "高" }
+                elif r.p != nil && r.p >= 30.0 { if lv == "低" { lv = "中" } }
+                if r.pr != nil && r.pr >= 2.0 { lv = "高" }
+                elif r.pr != nil && r.pr >= 0.5 { if lv == "低" { lv = "中" } }
+                if r.ap != nil && (r.ap >= 35.0 || r.ap <= 0.0) { lv = "高" }
+                elif r.ap != nil && r.ap >= 32.0 { if lv == "低" { lv = "中" } }
+                if r.ws != nil && r.ws >= 38.0 { lv = "高" }
+                elif r.ws != nil && r.ws >= 28.0 { if lv == "低" { lv = "中" } }
+                break
+            }
+        }
+    }
+    return lv
+}
+
+fn del_plan(i){
+    let kept = []
+    for j in g_plans.len() { if j != i { kept.push(g_plans[j]) } }
+    g_plans = kept
+    save_plans()
+    render_guard()
+}
+
+// ---------- 守护页:输入/编辑/选案 ----------
+
+fn g_start_input(text){
+    g_input = text
+    g_parse()
+}
+
+// 解析卡读回(编辑生效):short_date 反解日期,HH:MM/分钟读回
+fn g_reassess(){
+    let d = ui.g_date_box.text().trim()
+    let t = ui.g_time_box.text().trim()
+    let du = ui.g_dur_box.text().trim()
+    g_place = ui.g_place_box.text().trim()
+    // 「10/3 周六」→ 当年 M/D
+    let m = regex("([0-9]{1,2})/([0-9]{1,2})", "").exec(d)
+    if m != nil && m.captures.len() >= 3 {
+        g_date = fmt_ds(year_of(today_str()), m.captures[1].to_f64(), m.captures[2].to_f64())
+    }
+    let tv = regex("([0-9]{1,2}):([0-9]{2})", "").exec(t)
+    if tv != nil && tv.captures.len() >= 3 {
+        let h = tv.captures[1].to_f64()
+        let mi = tv.captures[2].to_f64()
+        if h <= 23.0 && mi <= 59.0 { g_start = fmt_hm(h, mi) }
+    }
+    let nv = du.to_f64()
+    if nv >= 15.0 && nv <= 720.0 { g_dur = round(nv) }
+    g_stage = 1
+    g_verify_line = ""
+    g_assess()
+}
+
+fn g_pick(i){
+    if i < g_opts.len() {
+        g_sel = i
+        ui.g_opt_rows.render()
+    }
+}
+
+fn checklist_str(p){
+    if p.checklist == nil || p.checklist.len() == 0 { return "" }
+    return " · 携带:" + join_list(p.checklist)
+}
+
+// ---------- 守护页:导航与渲染 ----------
+
+fn open_guard(){
+    g_screen = "guard"
+    load_plans()
+    ui.home_page.set_visible(false)
+    ui.guard_page.set_visible(true)
+    render_guard()
+}
+
+fn back_home(){
+    g_screen = "home"
+    ui.guard_page.set_visible(false)
+    ui.home_page.set_visible(true)
+    render_home()
+}
+
+fn render_guard(){
+    ui.g_note_lbl.set_text(g_note)
+    ui.g_parse_card.set_visible(g_stage >= 1)
+    if g_stage >= 1 {
+        ui.g_place_box.set_text(g_place)
+        ui.g_date_box.set_text(short_date(g_date))
+        ui.g_time_box.set_text(g_start)
+        ui.g_dur_box.set_text("" + g_dur)
+    }
+    ui.g_risk_card.set_visible(g_stage >= 2 && g_no_forecast == "")
+    if g_stage >= 2 && g_no_forecast == "" {
+        ui.g_risk_line.set_text("风险:" + g_risk_level + " · " + g_risk_line)
+        ui.g_risk_src.set_text(g_risk_src)
+    }
+    ui.g_nofc_lbl.set_text(g_no_forecast)
+    ui.g_nofc_lbl.set_visible(g_no_forecast != "")
+    ui.g_opt_card.set_visible(g_stage >= 2 && g_opts.len() > 0)
+    ui.g_opt_rows.render()
+    ui.g_confirm_btn.set_visible(g_stage >= 2)
+    ui.g_verify_btn.set_visible(g_stage == 3)
+    ui.g_verify_line.set_visible(g_verify_line != "")
+    ui.g_verify_line.set_text(g_verify_line)
+    ui.g_plan_rows.render()
+}
+
 // ---------- 启动 ----------
 
 fn boot(){
@@ -400,6 +1142,9 @@ let hairline = #xe5e5ea
 SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.color: #xffffff
     View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
         Label{text: "行程天气" draw_text.color: ink draw_text.text_style: theme.font_bold{font_size: 22}}
+        ButtonFlat{text: "行程守护" height: 36 padding: Inset{left: 12 right: 12} on_click: || open_guard()
+            draw_bg +: {border_radius: 18.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
+            draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
         city_btn := ButtonFlat{text: "深圳 切换" height: 36 padding: Inset{left: 14 right: 14} on_click: || toggle_panel()
             draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
             draw_text +: {color: ink color_hover: ink color_down: ink}}
@@ -440,12 +1185,14 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
         }}
     }
     Hr{}
+    home_page := View{width: Fill height: Fill flow: Down spacing: 10
     View{width: Fill height: Fit flow: Down spacing: 2
         temp_lbl := Label{text: "—" draw_text.color: ink draw_text.text_style: theme.font_bold{font_size: 54}}
         cond_lbl := Label{text: "" draw_text.color: ink draw_text.text_style.font_size: 16}
         hilo_lbl := Label{text: "" draw_text.color: secondary draw_text.text_style.font_size: 13}
     }
-    Label{text: "未来 24 小时 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
+    hours_hdr := Label{width: Fill text: "未来 24 小时 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
+    days_hdr := Label{width: Fill text: "10 天预报 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
     hours_strip := ScrollXView{width: Fill height: Fit flow: Right spacing: 16 on_render: || {
         if wx == nil { Label{text: "暂无数据" draw_text.color: secondary draw_text.text_style.font_size: 12} }
         else {
@@ -471,4 +1218,93 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             }
         }
     }}
+    }
+    // ---------- 守护页 ----------
+    guard_page := View{visible: false width: Fill height: Fill flow: Down spacing: 10
+        View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            ButtonFlat{text: "返回首页" height: 36 padding: Inset{left: 12 right: 12} on_click: || back_home()
+                draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
+                draw_text +: {color: ink color_hover: ink color_down: ink}}
+            Label{width: Fill text: "行程守护 · 规则版(无 agent)" draw_text.color: secondary draw_text.text_style.font_size: 12}
+        }
+        View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            g_in := TextInput{width: Fill height: 40 empty_text: "例如:周六上午 9 点去深圳湾骑车,大概两小时"
+                on_return: |text| g_start_input(text)
+                draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 10.0}
+                draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
+            ButtonFlat{text: "解析" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_start_input(ui.g_in.text())
+                draw_bg +: {border_radius: 20.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
+                draw_text +: {color: #xffffff color_hover: #ffffff color_down: #xffffff}}
+        }
+        g_note_lbl := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
+        ScrollYView{width: Fill height: Fill flow: Down spacing: 10
+            g_parse_card := View{visible: false width: Fill height: Fit flow: Down spacing: 6
+                Label{text: "解析卡(可修改后重新评估)" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                View{width: Fill height: Fit flow: Right spacing: 6
+                    Label{text: "地点" draw_text.color: ink draw_text.text_style.font_size: 13}
+                    g_place_box := TextInput{width: Fill height: 34 empty_text: "如:深圳湾"
+                        draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
+                        draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
+                }
+                View{width: Fill height: Fit flow: Right spacing: 6
+                    Label{text: "日期" draw_text.color: ink draw_text.text_style.font_size: 13}
+                    g_date_box := TextInput{width: Fill height: 34 empty_text: "如:10/3 周六"
+                        draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
+                        draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
+                    Label{text: "时间" draw_text.color: ink draw_text.text_style.font_size: 13}
+                    g_time_box := TextInput{width: 70 height: 34 empty_text: "09:00"
+                        draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
+                        draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
+                    Label{text: "分钟" draw_text.color: ink draw_text.text_style.font_size: 13}
+                    g_dur_box := TextInput{width: 60 height: 34 empty_text: "120"
+                        draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
+                        draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
+                }
+                ButtonFlat{text: "评估风险" height: 36 padding: Inset{left: 14 right: 14} on_click: || g_reassess()
+                    draw_bg +: {border_radius: 18.0 color: #x34c759 color_hover: #x30b350 color_down: #x28a24a border_size: 0.0}
+                    draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
+            }
+            g_nofc_lbl := Label{visible: false width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 13}
+            g_risk_card := View{visible: false width: Fill height: Fit flow: Down spacing: 4
+                Label{text: "风险卡" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                g_risk_line := Label{width: Fill text: "" draw_text.color: ink draw_text.text_style.font_size: 14}
+                g_risk_src := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
+            }
+            g_opt_card := View{visible: false width: Fill height: Fit flow: Down spacing: 6
+                Label{text: "方案卡(单击选择)" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                g_opt_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
+                    for i o in g_opts {
+                        GestureView{width: Fill height: Fit padding: 10 on_tap: |x, y| g_pick(i)
+                            View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                Label{text: (if i == g_sel { "▶ " } else { "   " }) + o.id + " · " + o.label draw_text.color: ink draw_text.text_style.font_size: 15}
+                            }
+                            Label{width: Fill text: o.why draw_text.color: secondary draw_text.text_style.font_size: 11}
+                        }
+                    }
+                }}
+            }
+            View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                g_confirm_btn := ButtonFlat{visible: false text: "确认执行" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_confirm()
+                    draw_bg +: {border_radius: 20.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
+                    draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
+                g_verify_btn := ButtonFlat{visible: false text: "核验" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_verify()
+                    draw_bg +: {border_radius: 20.0 color: #x34c759 color_hover: #x30b350 color_down: #x28a24a border_size: 0.0}
+                    draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
+            }
+            g_verify_line := Label{visible: false width: Fill text: "" draw_text.color: ink draw_text.text_style.font_size: 13}
+            Hr{}
+            Label{text: "行程簿" draw_text.color: secondary draw_text.text_style.font_size: 11}
+            g_plan_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
+                if g_plans.len() == 0 { Label{text: "还没有已确认的计划" draw_text.color: secondary draw_text.text_style.font_size: 12} }
+                for i p in g_plans {
+                    GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| del_plan(i)
+                        View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                            Label{width: Fill text: p.place + " · " + short_date(p.date) + " " + p.start + (if p.indoor {" · 室内"} else {""}) + checklist_str(p) draw_text.color: ink draw_text.text_style.font_size: 14}
+                            Label{text: "删除" draw_text.color: #xff3b30 draw_text.text_style.font_size: 12}
+                        }
+                    }
+                }
+            }}
+        }
+    }
 }
