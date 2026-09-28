@@ -827,7 +827,15 @@ fn g_assess(){
     }
     g_note = "风险:" + level + " · 正在请 agent 给方案…"
     render_guard()
-    let prompt = "计划窗口风险等级:" + level + "。事实(窗内最差值,数据时间 " + fmt_dt(wx.time) + "):" + g_risk_line + "。请只回 JSON:{options:[{action,why,checklist[]}]},1-3 项;action 只能是 reschedule/mark_indoor/add_checklist/keep 之一;checklist 只能来自 [雨具,补水,保暖衣物,防晒];why 里的每个数字必须来自上面事实;不得含 URL。"
+    // #29-5b: 把代码选定的改期目标一并告诉 agent,why 围绕它写
+    let resched_hint = ""
+    let next_t = ""
+    for i in 5 {
+        let cand = shift_date(g_date, i + 1)
+        if day_level(cand) != "高" { next_t = cand break }
+    }
+    if next_t != "" { resched_hint = "。若建议改期,目标日期是 " + next_t + "(" + short_date(next_t) + " 同一时段)" }
+    let prompt = "计划窗口风险等级:" + level + "。事实(窗内最差值,数据时间 " + fmt_dt(wx.time) + "):" + g_risk_line + resched_hint + "。请只回 JSON:{options:[{action,why,checklist[]}]},1-3 项;action 只能是 reschedule/mark_indoor/add_checklist/keep 之一;checklist 只能来自 [雨具,补水,保暖衣物,防晒];why 里的每个数字必须来自上面事实;不得含 URL。"
     agent_ask("options", prompt)
 }
 
@@ -1192,11 +1200,55 @@ fn day_level_of(ds, start, dur){
     return lv
 }
 
+let g_undo_plan = nil      // #29-5: 3 秒内可撤销的删除
+let g_undo_idx = 0
+let g_undo_timer = nil
+
+fn plan_row_tap(i){
+    if g_undo_plan != nil {
+        undo_del()
+        return
+    }
+    del_plan(i)
+}
+
 fn del_plan(i){
+    if g_undo_plan != nil {
+        // 上一次撤销窗口未关:先落定(视为删除)
+        stop_timer(g_undo_timer)
+        g_undo_plan = nil
+    }
+    g_undo_idx = i
+    g_undo_plan = g_plans[i]
     let kept = []
     for j in g_plans.len() { if j != i { kept.push(g_plans[j]) } }
     g_plans = kept
     save_plans()
+    g_note = "已删除;3 秒内点「撤销删除」可恢复"
+    g_undo_timer = start_timeout(3.0, || undo_close())
+    render_guard()
+}
+
+fn undo_close(){
+    g_undo_plan = nil
+    render_guard()
+}
+
+fn undo_del(){
+    if g_undo_plan == nil { return }
+    stop_timer(g_undo_timer)
+    // 插回原位(超范围则放末尾)
+    let out = []
+    let placed = false
+    for j in g_plans.len() {
+        if j == g_undo_idx { out.push(g_undo_plan) placed = true }
+        out.push(g_plans[j])
+    }
+    if !placed { out.push(g_undo_plan) }
+    g_plans = out
+    g_undo_plan = nil
+    save_plans()
+    g_note = "已撤销删除"
     render_guard()
 }
 
@@ -1303,7 +1355,7 @@ fn render_guard(){
     ui.g_nofc_lbl.set_visible(g_no_forecast != "")
     ui.g_opt_card.set_visible(g_stage >= 2 && g_opts.len() > 0)
     ui.g_opt_rows.render()
-    ui.g_confirm_btn.set_visible(g_stage >= 2)
+    ui.g_confirm_btn.set_visible(g_stage >= 2 && g_opts.len() > 0)
     ui.g_verify_btn.set_visible(g_stage == 3)
     ui.g_verify_line.set_visible(g_verify_line != "")
     ui.g_verify_line.set_text(g_verify_line)
@@ -1796,9 +1848,14 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             Hr{}
             Label{text: "行程簿" draw_text.color: secondary draw_text.text_style.font_size: 11}
             g_plan_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
-                if g_plans.len() == 0 { Label{text: "还没有已确认的计划" draw_text.color: secondary draw_text.text_style.font_size: 12} }
+                if g_undo_plan != nil {
+                    GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| undo_del()
+                        Label{width: Fill text: "↩ 撤销删除:" + g_undo_plan.place + " " + short_date(g_undo_plan.date) + " " + g_undo_plan.start draw_text.color: #xff9500 draw_text.text_style.font_size: 14}
+                    }
+                }
+                if g_plans.len() == 0 && g_undo_plan == nil { Label{text: "还没有已确认的计划" draw_text.color: secondary draw_text.text_style.font_size: 12} }
                 for i p in g_plans {
-                    GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| del_plan(i)
+                    GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| plan_row_tap(i)
                         View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                             Label{width: Fill text: p.place + " · " + short_date(p.date) + " " + p.start + (if p.indoor {" · 室内"} else {""}) + checklist_str(p) draw_text.color: ink draw_text.text_style.font_size: 14}
                             Label{text: "删除" draw_text.color: #xff3b30 draw_text.text_style.font_size: 12}
