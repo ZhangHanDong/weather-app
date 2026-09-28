@@ -513,6 +513,7 @@ fn g_parse(){
             let cur_wd = wd_of(today)
             let d = want - cur_wd
             if d <= 0 { d = d + 7 }
+            if text.search("下周") >= 0 || text.search("下星期") >= 0 { d = d + 7 }
             pdate = shift_date(today, d)
         }
     }
@@ -530,7 +531,7 @@ fn g_parse(){
     }
     if pdate == "" { pdate = today }
     // 时间
-    let hh = 9
+    let hh = -1
     let mm = 0
     let t_found = false
     let t24 = parse_hhmm(text)
@@ -539,19 +540,22 @@ fn g_parse(){
         let h12 = parse_cn_hour(text)
         if h12 != nil { hh = h12[0] mm = h12[1] t_found = true }
     }
-    if hh > 23 { hh = 9 }
+    if t_found && hh > 23 { hh = -1 t_found = false }
     // 时长
     let dur = 120
     let du = parse_dur(text)
     if du > 0 { dur = du }
+    // 日期默认今天(如实告知,不算缺项)
+    let date_is_today = pdate == today
     g_place = parse_place(text)
     g_date = pdate
-    g_start = fmt_hm(hh + 0.0, mm + 0.0)
+    g_start = ""
+    if t_found { g_start = fmt_hm(hh + 0.0, mm + 0.0) }
     g_dur = dur
     g_stage = 1
     g_no_forecast = ""
     g_verify_line = ""
-    // 缺项提示(#24):解析卡就是补全入口,note 点名缺什么。
+    // 缺项提示(#24/#25-3):缺项框留空;日期默认今天要写明。
     let missing = []
     if g_place == "" { missing.push("地点") }
     if !t_found { missing.push("时间") }
@@ -559,6 +563,12 @@ fn g_parse(){
         g_note = "已解析,但缺:" + join_list(missing) + " · 请在解析卡补全后再评估"
     } else {
         g_note = "已解析(本地规则)· 按「评估风险」继续"
+    }
+    if missing.len() > 0 && date_is_today {
+        g_note = "已解析,但缺:" + join_list(missing) + " · 日期按今天;请在解析卡补全后再评估"
+    }
+    if missing.len() == 0 && date_is_today && text.search("今天") < 0 && text.search("明天") < 0 && text.search("后天") < 0 {
+        g_note = "已解析(日期按今天)· 按「评估风险」继续"
     }
     render_guard()
 }
@@ -598,6 +608,9 @@ fn parse_hhmm(text){
         let h = m2.captures[1].to_f64()
         if pm && h < 12.0 { h = h + 12.0 }
         if h >= 24.0 { return nil }
+        // 「3点半」:命中点位的紧后是「半」→ :30
+        let idx_half = t.search("半")
+        if idx_half >= 0 && idx_half - m2.index >= 0 && idx_half - m2.index <= 6 { return [h, 30.0] }
         return [h, 0.0]
     }
     return nil
@@ -679,7 +692,7 @@ fn parse_place(text){
     let i = text.search("去")
     if i < 0 { return "" }
     // 「去」之后到第一个活动词/句尾
-    let stops = ["骑车","骑行","爬山","跑步","露营","野餐","散步","拍照","看日出","看日落","玩水","玩","钓鱼","徒步"]
+    let stops = ["看日出","看日落","看海","逛街","游泳","骑车","骑行","爬山","跑步","徒步","露营","野餐","散步","拍照","玩水","钓鱼"]
     let tail = text
     for st in stops {
         let m = regex("去([一-龥A-Za-z0-9]+)" + st, "").exec(text)
@@ -688,6 +701,21 @@ fn parse_place(text){
     if tail == text {
         let m2 = regex("去([一-龥A-Za-z0-9]+)", "").exec(text)
         if m2 != nil && m2.captures.len() >= 2 { tail = m2.captures[1] }
+    }
+    // 尾部剥离残留活动词(「大梅沙游泳」→「大梅沙」;多轮防「玩」类单字循环)
+    let again = true
+    let guard_n = 0
+    while again && guard_n < 6 {
+        again = false
+        guard_n = guard_n + 1
+        for st in stops {
+            let suf = tail.strip_suffix(st)
+            if suf != nil && suf != tail {
+                tail = suf
+                again = true
+                break
+            }
+        }
     }
     return tail.trim()
 }
@@ -698,6 +726,11 @@ fn parse_place(text){
 //   体感 ≥35 或 ≤0 高 / 32-34.9 中;风速(户外) ≥38 高 / 28-37 中;UV ≥8 中。
 fn g_assess(){
     if wx == nil { g_note = "天气数据还没就绪,稍等再试" render_guard() return }
+    if g_place == "" || g_start == "" {
+        g_note = "解析卡还有缺项(地点/时间),补全后再评估"
+        render_guard()
+        return
+    }
     let hall = wx.hall
     if hall.len() == 0 { g_note = "逐小时数据不可用,稍后再试" render_guard() return }
     // 窗口小时(start 的 HH,含 start 整点,共 ceil(dur/60)+1 个采样)
@@ -713,7 +746,7 @@ fn g_assess(){
     }
     if rows.len() == 0 {
         // 该日期无逐小时数据 → 超窗(预报只到今天+15 天)
-        g_no_forecast = gap_days_str(g_date) + " 后的天气还没有可靠预报"
+        g_no_forecast = gap_days_str(g_date) + "后的天气还没有可靠预报"
         g_risk_level = ""
         g_risk_line = ""
         g_opts = []
@@ -769,15 +802,27 @@ fn worst_row(rows, key){
     return best
 }
 
+// #25-5:风险卡五项全列(窗内最差值+小时),不只列触发因子;触发项加「▲」。
 fn hit_line(rows, hits){
-    if hits.len() == 0 { return "计划时段未触发风险规则" }
+    let items = [
+        {name: "降水概率" key: "p" fmt: "%"},
+        {name: "降水量" key: "pr" fmt: "毫米"},
+        {name: "体感温度" key: "ap" fmt: "°C"},
+        {name: "风速" key: "ws" fmt: "公里/时"},
+        {name: "紫外线" key: "uv" fmt: ""},
+    ]
     let parts = []
-    for h in hits {
-        if h == "降水概率" { let w = worst_row(rows, "p") if w != nil { parts.push("降水概率 " + int_str(w.v) + "%(" + w.h + ":00)") } }
-        if h == "小时降水量" { let w = worst_row(rows, "pr") if w != nil { parts.push("小时降水量 " + w.v + " 毫米(" + w.h + ":00)") } }
-        if h == "体感温度" { let w = worst_row(rows, "ap") if w != nil { parts.push("体感温度 " + w.v + "°C(" + w.h + ":00)") } }
-        if h == "风速" { let w = worst_row(rows, "ws") if w != nil { parts.push("风速 " + w.v + " 公里/时(" + w.h + ":00)") } }
-        if h == "UV指数" { let w = worst_row(rows, "uv") if w != nil { parts.push("UV指数 " + w.v + "(" + w.h + ":00)") } }
+    for it in items {
+        let mark = ""
+        if in_list(hits, it.name) { mark = "▲" }
+        let w = worst_row(rows, it.key)
+        if w == nil {
+            parts.push(it.name + " 无")
+        } else {
+            let v = "" + w.v
+            if it.key == "p" { v = int_str(w.v) }
+            parts.push(it.name + mark + " " + v + it.fmt + "(" + w.h + ":00)")
+        }
     }
     let out = parts[0]
     for i in parts.len() {
@@ -992,18 +1037,26 @@ fn g_verify(){
     let p = g_plans[g_plans.len()-1]
     let lv = day_level_of(p.date, p.start, p.dur)
     let readback = p.place + " " + short_date(p.date) + " " + p.start
+    let verdict = ""
     if p.indoor {
         g_verify_line = "核验通过 · 读回 " + readback + " · 室内"
         g_note = "核验通过"
+        verdict = "通过(室内)"
     }
     elif lv == "高" {
         g_verify_line = "核验未通过 · 读回 " + readback + " · 新时段风险高"
         g_note = "核验未通过,可重选方案"
+        verdict = "未通过(新时段风险高)"
     }
     else {
         g_verify_line = "核验通过 · 读回 " + readback + " · 新时段风险" + lv
         g_note = "核验通过"
+        verdict = "通过(新时段风险" + lv + ")"
     }
+    // #25-8:核验也记台账(kind=verify,结果+原因+数据时间)
+    let seq = ledger_seq()
+    g_ledger.push({seq: seq at: fmt_dt(wx.time) kind: "verify" action_id: "verify:" + p.id detail: "核验" + verdict + ";读回 " + p.place + " " + p.date + " " + p.start + ";数据时间 " + fmt_dt(wx.time)})
+    save_ledger()
     render_guard()
 }
 
@@ -1148,8 +1201,8 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
         city_btn := ButtonFlat{text: "深圳 切换" height: 36 padding: Inset{left: 14 right: 14} on_click: || toggle_panel()
             draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
             draw_text +: {color: ink color_hover: ink color_down: ink}}
-        note_lbl := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
     }
+    note_lbl := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
     panel := View{visible: false width: Fill height: Fit flow: Down spacing: 8
         View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             sbox := TextInput{width: Fill height: 36 empty_text: "搜索城市,如:成都 / 朝阳"
@@ -1192,7 +1245,6 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
         hilo_lbl := Label{text: "" draw_text.color: secondary draw_text.text_style.font_size: 13}
     }
     hours_hdr := Label{width: Fill text: "未来 24 小时 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
-    days_hdr := Label{width: Fill text: "10 天预报 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
     hours_strip := ScrollXView{width: Fill height: Fit flow: Right spacing: 16 on_render: || {
         if wx == nil { Label{text: "暂无数据" draw_text.color: secondary draw_text.text_style.font_size: 12} }
         else {
@@ -1205,7 +1257,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             }
         }
     }}
-    Label{text: "10 天预报 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
+    days_hdr := Label{width: Fill text: "10 天预报 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
     days_list := ScrollYView{width: Fill height: Fill flow: Down spacing: 8 on_render: || {
         if wx == nil { Label{text: "暂无数据" draw_text.color: secondary draw_text.text_style.font_size: 12} }
         else {
@@ -1252,7 +1304,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
                         draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
                         draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
                     Label{text: "时间" draw_text.color: ink draw_text.text_style.font_size: 13}
-                    g_time_box := TextInput{width: 70 height: 34 empty_text: "09:00"
+                    g_time_box := TextInput{width: 70 height: 34 empty_text: "HH:MM"
                         draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
                         draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
                     Label{text: "分钟" draw_text.color: ink draw_text.text_style.font_size: 13}
