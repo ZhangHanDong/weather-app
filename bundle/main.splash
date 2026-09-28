@@ -54,6 +54,8 @@ let g_agent_pending = false
 let g_agent_timer = nil
 let g_agent_chan = ""            // parse | options
 let g_src_parse = "规则"
+let g_agent_reject = false       // #28-5: 拒绝后展示「改用规则」
+let g_exec_fail = ""             // #28-4: 执行失败原因(空=成功)
 let g_src_opts = "规则"
 
 // ---------- 工具 ----------
@@ -151,7 +153,7 @@ fn load_cities(){
     cities = []
     for c in DEFAULT_CITIES { cities.push(c) }
     cur = 0
-    if fs.exists("cities.json") {
+    if file_ok("cities.json") {
         let v = fs.read("cities.json").parse_json()
         if v != nil && v.list != nil && v.list.len() > 0 {
             let got = []
@@ -298,6 +300,17 @@ fn refresh(){
 // ---------- 渲染 ----------
 
 fn render_home(){
+    if cities.len() == 0 {
+        ui.temp_lbl.set_text("—")
+        ui.cond_lbl.set_text("还没有城市")
+        ui.hilo_lbl.set_text("点右上「切换」搜索并添加一个城市")
+        ui.hours_hdr.set_text("未来 24 小时 · 数据来自 Open-Meteo")
+        ui.days_hdr.set_text("10 天预报 · 数据来自 Open-Meteo")
+        ui.hours_strip.render()
+        ui.days_list.render()
+        ui.note_lbl.set_text("")
+        return
+    }
     if wx == nil {
         ui.temp_lbl.set_text("—")
         ui.cond_lbl.set_text("暂无数据")
@@ -980,14 +993,35 @@ fn join_list(list){
 
 // ---------- 守护页:确认执行 / 幂等 / 核验 ----------
 
+// #28-4 伴生:路径被目录占用等损坏情形下,fs.exists 为真但 fs.read 抛错
+// (实测 [E] file not found)。fs.list 里目录以 / 结尾——只读真文件。
+fn file_ok(name){
+    let names = fs.list(".")
+    for n in names {
+        if n == name + "/" { return false }
+        if n == name { return true }
+    }
+    return false
+}
+
+// #28-4: fs.write 对被目录占用的路径是 isolate trap(实测 byte-range panic),
+// 返回值检查来不及执行——写前预检目录占用,避开 panic 路径。
+fn path_blocked(name){
+    let names = fs.list(".")
+    for n in names {
+        if n == name + "/" { return true }
+    }
+    return false
+}
+
 fn load_plans(){
     g_plans = []
     g_ledger = []
-    if fs.exists("plans.json") {
+    if file_ok("plans.json") {
         let v = fs.read("plans.json").parse_json()
         if v != nil && has_key(v, "list") { g_plans = v.list }
     }
-    if fs.exists("ledger.json") {
+    if file_ok("ledger.json") {
         let v2 = fs.read("ledger.json").parse_json()
         if v2 != nil && has_key(v2, "entries") { g_ledger = v2.entries }
     }
@@ -1039,6 +1073,10 @@ fn redate_plan(plan, opt){
 fn g_confirm(){
     // 幂等:同一方案(action 键)再确认 → 不重复执行。stage 已是 3 时
     // 也要回答「未重复」而不是静默 return(#24 验收点)。
+    if g_exec_fail != "" {
+        // 重试:上次失败已回滚内存,直接重走
+        g_exec_fail = ""
+    }
     if (g_stage != 2 && g_stage != 3) || g_opts.len() == 0 { return }
     let opt = g_opts[g_sel]
     let act_id = plan_key(opt)
@@ -1048,14 +1086,33 @@ fn g_confirm(){
         return
     }
     if g_stage != 2 { return }
+    if path_blocked("plans.json") || path_blocked("ledger.json") {
+        g_exec_fail = "存储不可用(行程簿/台账文件无法写入),未执行;排除后点「确认执行」重试"
+        render_guard()
+        return
+    }
     let plan = {id: "p" + time_now() place: g_place date: g_date start: g_start dur: g_dur indoor: false rescheduled: false checklist: [] done: false}
-    let before = g_date + " " + g_start
     let after = apply_action(plan, opt)
     g_plans.push(after)
-    save_plans()
+    // #28-4: 持久化失败 → 不记成功台账,给原因,可重试(再点确认)
+    let w1 = fs.write("plans.json", {list: g_plans}.to_json())
+    if w1 != nil {
+        // 错误值不能拼进字符串(实测 isolate panic: byte range)——固定文案
+        g_plans.pop()
+        g_exec_fail = "行程簿保存失败(无法写入 plans.json),未执行;再点「确认执行」重试"
+        render_guard()
+        return
+    }
     let seq = ledger_seq()
     g_ledger.push({seq: seq at: fmt_dt(wx.time) kind: "exec" action_id: act_id detail: opt.label + " → 已应用;执行前 " + g_date + " " + g_start + " · 户外"})
-    save_ledger()
+    let w2 = fs.write("ledger.json", {entries: g_ledger}.to_json())
+    if w2 != nil {
+        g_plans.pop()
+        g_ledger.pop()
+        g_exec_fail = "台账保存失败(无法写入 ledger.json),未执行;再点「确认执行」重试"
+        render_guard()
+        return
+    }
     g_last_action_id = act_id
     g_stage = 3
     g_note = "已执行(台账 #" + seq + ")· 按「核验」重新取数比对"
@@ -1225,6 +1282,9 @@ fn render_guard(){
     ui.g_note_lbl.set_text(g_note)
     if g_agent_state == 1 { ui.g_title.set_text("行程守护 · agent 版") }
     else { ui.g_title.set_text("行程守护 · 规则版(无 agent)") }
+    ui.g_rules_btn.set_visible(g_agent_reject)
+    ui.g_execfail_lbl.set_visible(g_exec_fail != "")
+    ui.g_execfail_lbl.set_text(g_exec_fail)
     ui.g_parse_src.set_text("解析卡(来源:" + g_src_parse + " · 可修改后重新评估)")
     ui.g_opt_src.set_text("方案卡(来源:" + g_src_opts + " · 单击选择)")
     ui.g_parse_card.set_visible(g_stage >= 1)
@@ -1447,6 +1507,7 @@ fn agent_ask(chan, prompt){
         return
     }
     g_agent_chan = chan
+    g_agent_reject = false
     g_agent_pending = true
     g_agent_timer = start_timeout(30.0, || agent_timeout())
     host.request("octos.session.open", {}, fn(sess){
@@ -1471,6 +1532,26 @@ fn agent_ask(chan, prompt){
             agent_reply(chan, r.data.text)
         })
     })
+}
+
+fn agent_use_rules_now(){
+    g_agent_state = 2
+    g_agent_reject = false
+    if g_agent_chan == "parse" {
+        g_src_parse = "规则"
+        g_parse()
+        g_note = agent_unavailable_note() + " · " + g_note
+    } else {
+        g_src_opts = "规则"
+        build_options(g_risk_level, [], nil, nil, nil, nil)
+        g_note = "风险:" + g_risk_level + " · " + agent_unavailable_note()
+    }
+    render_guard()
+}
+
+// #28-5: 普通用户能看懂的不合规文案
+fn agent_bad_note(technical){
+    return "助手回复没有通过检查(" + technical + ")。可以点「改用规则」继续,不影响使用"
 }
 
 fn agent_fallback(chan){
@@ -1521,13 +1602,13 @@ fn agent_reply(chan, text){
             g_agent_bad = g_agent_bad + 1
             agent_ledger(chan, false, v.why)
             if g_agent_bad >= 2 {
-                g_note = "agent 连续两次不合规(" + v.why + "),已改用规则方案"
                 agent_fallback(chan)
-                g_note = "agent 连续两次不合规(" + v.why + "),已改用规则方案"
+                g_note = "助手连续两次没有通过检查(" + v.why + "),已改用规则方案"
                 render_guard()
                 return
             }
-            g_note = "agent 回复不合规(" + v.why + "),重试或回退规则"
+            g_note = agent_bad_note(v.why)
+            g_agent_reject = true
             render_guard()
             return
         }
@@ -1641,7 +1722,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             ButtonFlat{text: "返回首页" height: 36 padding: Inset{left: 12 right: 12} on_click: || back_home()
                 draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
                 draw_text +: {color: ink color_hover: ink color_down: ink}}
-            g_title := Label{width: Fill text: "行程守护 · 规则版(无 agent)" draw_text.color: secondary draw_text.text_style.font_size: 12}
+            g_title := Label{width: Fill text: "行程守护" draw_text.color: secondary draw_text.text_style.font_size: 12}
         }
         View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             g_in := TextInput{width: Fill height: 40 empty_text: "例如:周六上午 9 点去深圳湾骑车,大概两小时"
@@ -1703,11 +1784,15 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
                 g_confirm_btn := ButtonFlat{visible: false text: "确认执行" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_confirm()
                     draw_bg +: {border_radius: 20.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
                     draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
+                g_rules_btn := ButtonFlat{visible: false text: "改用规则" height: 40 padding: Inset{left: 16 right: 16} on_click: || agent_use_rules_now()
+                    draw_bg +: {border_radius: 20.0 color: #xff9500 color_hover: #xe08600 color_down: #xc47600 border_size: 0.0}
+                    draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
                 g_verify_btn := ButtonFlat{visible: false text: "核验" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_verify()
                     draw_bg +: {border_radius: 20.0 color: #x34c759 color_hover: #x30b350 color_down: #x28a24a border_size: 0.0}
                     draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
             }
             g_verify_line := Label{visible: false width: Fill text: "" draw_text.color: ink draw_text.text_style.font_size: 13}
+            g_execfail_lbl := Label{visible: false width: Fill text: "" draw_text.color: #xff3b30 draw_text.text_style.font_size: 12}
             Hr{}
             Label{text: "行程簿" draw_text.color: secondary draw_text.text_style.font_size: 11}
             g_plan_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
