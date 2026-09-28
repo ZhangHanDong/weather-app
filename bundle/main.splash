@@ -1228,7 +1228,8 @@ fn g_confirm(){
     }
     g_last_action_id = act_id
     g_stage = 3
-    g_note = "已执行(台账 #" + seq + ")· 按「核验」重新取数比对"
+    g_step = 4
+    g_note = "已执行(台账 #" + seq + ")· 已到第④步,按「核验」重新取数比对"
     render_guard()
 }
 
@@ -1443,6 +1444,7 @@ fn gos(n){
     ui.g_s1.set_visible(n == 1)
     ui.g_s2.set_visible(n == 2)
     ui.g_s3.set_visible(n == 3)
+    ui.g_s4.set_visible(n == 4)
 }
 
 fn render_guard(){
@@ -1455,9 +1457,11 @@ fn render_guard(){
     ui.g_parse_src.set_text("解析卡(来源:" + g_src_parse + " · 可修改后重新评估)")
     ui.g_opt_src.set_text("方案卡(来源:" + g_src_opts + " · 单击选择)")
     // #31: 卡片常驻,按步容器显隐(不依赖宿主滚动,也不靠一次性 set_visible)
+    ui.g_input_row.set_visible(g_stage < 2)
     ui.g_s1.set_visible(g_step == 1)
     ui.g_s2.set_visible(g_step == 2)
     ui.g_s3.set_visible(g_step == 3)
+    ui.g_s4.set_visible(g_step == 4)
     if g_stage >= 1 {
         ui.g_place_box.set_text(g_place)
         ui.g_date_box.set_text(short_date(g_date))
@@ -1898,95 +1902,105 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
     }}
     }
 // ---------- 守护页(#31 分步:每步 ≤~420px,不依赖宿主滚动) ----------
-    guard_page := View{visible: false width: Fill height: Fill flow: Down spacing: 8
+    guard_page := View{visible: false width: Fill height: Fill flow: Down spacing: 5
         View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            ButtonFlat{text: "返回首页" height: 36 padding: Inset{left: 12 right: 12} on_click: || back_home()
+            ButtonFlat{text: "返回首页" height: 28 padding: Inset{left: 10 right: 10} on_click: || back_home()
                 draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
                 draw_text +: {color: ink color_hover: ink color_down: ink}}
             g_title := Label{width: Fill text: "行程守护" draw_text.color: secondary draw_text.text_style.font_size: 12}
         }
-        View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            g_in := TextInput{width: Fill height: 40 empty_text: "例如:周六上午 9 点去深圳湾骑车,大概两小时"
+        g_input_row := View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            g_in := TextInput{width: Fill height: 32 empty_text: "例如:周六上午 9 点去深圳湾骑车,大概两小时"
                 on_return: |text| g_start_input(text)
                 draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 10.0}
                 draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
-            ButtonFlat{text: "解析" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_start_input(ui.g_in.text())
+            ButtonFlat{text: "解析" height: 32 padding: Inset{left: 14 right: 14} on_click: || g_start_input(ui.g_in.text())
                 draw_bg +: {border_radius: 20.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
                 draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
         }
-        g_note_lbl := Label{width: Fill height: Fit text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
+        g_note_lbl := Label{width: Fill height: Fit text: "" draw_text.color: secondary draw_text.text_style.font_size: 10}
         View{width: Fill height: Fit flow: Right spacing: 6
-            g_s1_btn := ButtonFlat{text: "① 解析" height: 32 padding: Inset{left: 10 right: 10} on_click: || gos(1)
+            g_s1_btn := ButtonFlat{text: "① 解析" height: 26 padding: Inset{left: 8 right: 8} on_click: || gos(1)
                 draw_bg +: {border_radius: 16.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
                 draw_text +: {color: ink color_hover: ink color_down: ink}}
-            g_s2_btn := ButtonFlat{text: "② 风险与方案" height: 32 padding: Inset{left: 10 right: 10} on_click: || gos(2)
+            g_s2_btn := ButtonFlat{text: "② 风险" height: 26 padding: Inset{left: 8 right: 8} on_click: || gos(2)
                 draw_bg +: {border_radius: 16.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
                 draw_text +: {color: ink color_hover: ink color_down: ink}}
-            g_s3_btn := ButtonFlat{text: "③ 结果与行程簿" height: 32 padding: Inset{left: 10 right: 10} on_click: || gos(3)
+            g_s3_btn := ButtonFlat{text: "③ 方案与执行" height: 26 padding: Inset{left: 8 right: 8} on_click: || gos(3)
+                draw_bg +: {border_radius: 16.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
+                draw_text +: {color: ink color_hover: ink color_down: ink}}
+            g_s4_btn := ButtonFlat{text: "④ 行程簿" height: 26 padding: Inset{left: 8 right: 8} on_click: || gos(4)
                 draw_bg +: {border_radius: 16.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
                 draw_text +: {color: ink color_hover: ink color_down: ink}}
         }
-        g_s1 := View{visible: true width: Fill height: Fill flow: Down spacing: 6
-            g_parse_card := View{width: Fill height: Fit flow: Down spacing: 6
+        g_s1 := View{visible: true width: Fill height: Fill flow: Down spacing: 4
+            g_parse_card := View{width: Fill height: Fit flow: Down spacing: 4
                 g_parse_src := Label{text: "解析卡(来源:规则 · 可修改后重新评估)" draw_text.color: secondary draw_text.text_style.font_size: 11}
                 View{width: Fill height: Fit flow: Right spacing: 6
                     Label{text: "地点" draw_text.color: ink draw_text.text_style.font_size: 13}
-                    g_place_box := TextInput{width: Fill height: 34 empty_text: "如:深圳湾"
+                    g_place_box := TextInput{width: Fill height: 27 empty_text: "如:深圳湾"
                         draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
                         draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
                 }
                 View{width: Fill height: Fit flow: Right spacing: 6
                     Label{text: "日期" draw_text.color: ink draw_text.text_style.font_size: 13}
-                    g_date_box := TextInput{width: Fill height: 34 empty_text: "如:10/3 周六"
+                    g_date_box := TextInput{width: Fill height: 27 empty_text: "如:10/3 周六"
                         draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
                         draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
                     Label{text: "时间" draw_text.color: ink draw_text.text_style.font_size: 13}
-                    g_time_box := TextInput{width: 70 height: 34 empty_text: "HH:MM"
+                    g_time_box := TextInput{width: 64 height: 27 empty_text: "HH:MM"
                         draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
                         draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
                     Label{text: "分钟" draw_text.color: ink draw_text.text_style.font_size: 13}
-                    g_dur_box := TextInput{width: 60 height: 34 empty_text: "120"
+                    g_dur_box := TextInput{width: 52 height: 27 empty_text: "120"
                         draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
                         draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
                 }
-                ButtonFlat{text: "评估风险" height: 36 padding: Inset{left: 14 right: 14} on_click: || g_reassess()
+                ButtonFlat{text: "评估风险" height: 28 padding: Inset{left: 12 right: 12} on_click: || g_reassess()
                     draw_bg +: {border_radius: 18.0 color: #x34c759 color_hover: #x30b350 color_down: #x28a24a border_size: 0.0}
                     draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
             }
             g_nofc_lbl := Label{width: Fill height: Fit text: "" draw_text.color: secondary draw_text.text_style.font_size: 13}
         }
-        g_s2 := View{visible: false width: Fill height: Fill flow: Down spacing: 6
+        g_s2 := View{visible: false width: Fill height: Fill flow: Down spacing: 4
             g_risk_card := View{width: Fill height: Fit flow: Down spacing: 4
                 Label{text: "风险卡" draw_text.color: secondary draw_text.text_style.font_size: 11}
-                g_risk_line := Label{width: Fill height: Fit text: "" draw_text.color: ink draw_text.text_style.font_size: 14}
-                g_risk_src := Label{width: Fill height: Fit text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                g_risk_line := Label{width: Fill height: Fit text: "" draw_text.color: ink draw_text.text_style.font_size: 11}
+                g_risk_src := Label{width: Fill height: Fit text: "" draw_text.color: secondary draw_text.text_style.font_size: 9}
             }
+        }
+        g_s3 := View{visible: false width: Fill height: Fill flow: Down spacing: 4
             View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                g_confirm_btn := ButtonFlat{visible: false text: "确认执行" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_confirm()
+                g_confirm_btn := ButtonFlat{visible: false text: "确认执行" height: 30 padding: Inset{left: 14 right: 14} on_click: || g_confirm()
                     draw_bg +: {border_radius: 20.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
                     draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
-                g_rules_btn := ButtonFlat{visible: false text: "改用规则" height: 40 padding: Inset{left: 16 right: 16} on_click: || agent_use_rules_now()
+                g_rules_btn := ButtonFlat{visible: false text: "改用规则" height: 30 padding: Inset{left: 14 right: 14} on_click: || agent_use_rules_now()
                     draw_bg +: {border_radius: 20.0 color: #xff9500 color_hover: #xe08600 color_down: #xc47600 border_size: 0.0}
                     draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
-                g_verify_btn := ButtonFlat{visible: false text: "核验" height: 40 padding: Inset{left: 16 right: 16} on_click: || g_verify()
-                    draw_bg +: {border_radius: 20.0 color: #x34c759 color_hover: #x30b350 color_down: #x28a24a border_size: 0.0}
-                    draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
             }
-            g_verify_line := Label{width: Fill height: Fit text: "" draw_text.color: ink draw_text.text_style.font_size: 13}
-            g_execfail_lbl := Label{width: Fill height: Fit text: "" draw_text.color: #xff3b30 draw_text.text_style.font_size: 12}
             g_opt_card := View{width: Fill height: Fit flow: Down spacing: 4
                 g_opt_src := Label{text: "方案卡(来源:规则 · 单击选择)" draw_text.color: secondary draw_text.text_style.font_size: 11}
-                g_opt_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
+                g_opt_rows := View{width: Fill height: Fit flow: Down spacing: 2 on_render: || {
                     for i o in g_opts {
-                        GestureView{width: Fill height: Fit flow: Down padding: 8 on_tap: |x, y| g_pick(i)
-                            Label{width: Fill text: (if i == g_sel { "▶ " } else { "   " }) + o.id + " · " + o.label draw_text.color: ink draw_text.text_style.font_size: 14}
-                            Label{width: Fill text: o.why draw_text.color: secondary draw_text.text_style.font_size: 11}
+                        GestureView{width: Fill height: Fit flow: Down padding: 3 on_tap: |x, y| g_pick(i)
+                            Label{width: Fill text: (if i == g_sel { "▶ " } else { "   " }) + o.id + " · " + o.label draw_text.color: ink draw_text.text_style.font_size: 12}
+                            if i == g_sel {
+                                Label{width: Fill text: o.why draw_text.color: secondary draw_text.text_style.font_size: 9}
+                            }
                         }
                     }
                 }}
             }
         }
-        g_s3 := View{visible: false width: Fill height: Fill flow: Down spacing: 4
+        }
+        g_s4 := View{visible: false width: Fill height: Fill flow: Down spacing: 4
+            View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                g_verify_btn := ButtonFlat{visible: false text: "核验" height: 30 padding: Inset{left: 14 right: 14} on_click: || g_verify()
+                    draw_bg +: {border_radius: 20.0 color: #x34c759 color_hover: #x30b350 color_down: #x28a24a border_size: 0.0}
+                    draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
+                g_verify_line := Label{width: Fill height: Fit text: "" draw_text.color: ink draw_text.text_style.font_size: 12}
+            }
+            g_execfail_lbl := Label{width: Fill height: Fit text: "" draw_text.color: #xff3b30 draw_text.text_style.font_size: 11}
             Label{text: "行程簿" draw_text.color: secondary draw_text.text_style.font_size: 11}
             g_plan_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
                 if g_undo_plan != nil {
@@ -1996,7 +2010,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
                 }
                 if g_plans.len() == 0 && g_undo_plan == nil { Label{text: "还没有已确认的计划" draw_text.color: secondary draw_text.text_style.font_size: 12} }
                 for i p in g_plans {
-                    GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| plan_row_tap(i)
+                    GestureView{width: Fill height: Fit padding: 5 on_tap: |x, y| plan_row_tap(i)
                         View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                             Label{width: Fill text: p.place + " · " + short_date(p.date) + " " + p.start + (if p.indoor {" · 室内"} else {""}) + checklist_str(p) draw_text.color: ink draw_text.text_style.font_size: 14}
                             Label{text: "删除" draw_text.color: #xff3b30 draw_text.text_style.font_size: 12}
