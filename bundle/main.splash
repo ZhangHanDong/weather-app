@@ -53,6 +53,7 @@ let g_verify_line = ""
 let g_agent_state = 0            // 0 未探测 1 可用 2 不可用
 let g_agent_bad = 0              // 连续不合规次数
 let g_agent_pending = false
+let g_opt_pending = false          // #33-2: 方案请求进行中(禁用评估按钮)
 let g_agent_timer = nil
 let g_agent_chan = ""            // parse | options
 let g_src_parse = "规则"
@@ -930,7 +931,8 @@ fn g_assess(){
         render_guard()
         return
     }
-    g_note = "风险:" + level + " · 正在请 agent 给方案…"
+    g_note = "风险:" + level + " · 正在请 agent 出方案…"
+    g_opt_pending = true
     render_guard()
     // #29-5b: 把代码选定的改期目标一并告诉 agent,why 围绕它写
     let resched_hint = ""
@@ -1425,6 +1427,8 @@ fn open_guard(){
     g_screen = "guard"
     load_plans()
     ui.app_head.set_visible(false)
+    ui.note_lbl.set_visible(false)
+    ui.guard_hr.set_visible(false)
     ui.home_page.set_visible(false)
     ui.guard_page.set_visible(true)
     render_guard()
@@ -1433,6 +1437,8 @@ fn open_guard(){
 fn back_home(){
     g_screen = "home"
     ui.app_head.set_visible(true)
+    ui.note_lbl.set_visible(true)
+    ui.guard_hr.set_visible(true)
     ui.guard_page.set_visible(false)
     ui.home_page.set_visible(true)
     render_home()
@@ -1441,6 +1447,8 @@ fn back_home(){
 // #31: 分步导航(不依赖宿主滚动;每步内容自适应 ≤~420px)
 fn gos(n){
     g_step = n
+    // #33: 输入行跟着步①走(gos 不经过 render_guard,须在此显式同步)
+    ui.g_input_row.set_visible(n == 1)
     ui.g_s1.set_visible(n == 1)
     ui.g_s2.set_visible(n == 2)
     ui.g_s3.set_visible(n == 3)
@@ -1449,15 +1457,22 @@ fn gos(n){
 
 fn render_guard(){
     ui.g_note_lbl.set_text(g_note)
-    if g_agent_state == 1 { ui.g_title.set_text("行程守护 · agent 版") }
+    // #33-4: 标题反映「本次方案/解析」的真实来源——键在来源标志而非 state
+    // (点「改用规则」后 state=2,但本次解析若来自 agent,标题仍应如实说明)
+    if g_src_opts == "agent" { ui.g_title.set_text("行程守护 · agent 版") }
+    elif g_src_parse == "agent" { ui.g_title.set_text("行程守护 · 解析来自 agent · 方案由规则给出") }
     else { ui.g_title.set_text("行程守护 · 规则版(无 agent)") }
     ui.g_rules_btn.set_visible(g_agent_reject)
+    // #33-2: 文档化 API 只有 set_visible/set_text——pending 时藏评估按钮,行内提示进度
+    // #33-2: 请求期间藏按钮防重复点击;进度文案走 g_note(「正在请 agent 出方案…」)
+    ui.g_assess_btn.set_visible(!g_opt_pending && !g_agent_pending)
     ui.g_execfail_lbl.set_visible(g_exec_fail != "")
     ui.g_execfail_lbl.set_text(g_exec_fail)
     ui.g_parse_src.set_text("解析卡(来源:" + g_src_parse + " · 可修改后重新评估)")
     ui.g_opt_src.set_text("方案卡(来源:" + g_src_opts + " · 单击选择)")
     // #31: 卡片常驻,按步容器显隐(不依赖宿主滚动,也不靠一次性 set_visible)
-    ui.g_input_row.set_visible(g_stage < 2)
+    // #33: 输入行只在步①显示——回①可重新解析;②③④省 42px
+    ui.g_input_row.set_visible(g_step == 1)
     ui.g_s1.set_visible(g_step == 1)
     ui.g_s2.set_visible(g_step == 2)
     ui.g_s3.set_visible(g_step == 3)
@@ -1536,6 +1551,7 @@ fn agent_timeout(){
         g_note = agent_unavailable_note()
         render_guard()
     } else {
+        g_opt_pending = false
         g_opts = []
         build_options(g_risk_level, [], nil, nil, nil, nil)
         g_src_opts = "规则"
@@ -1552,6 +1568,111 @@ fn num_ok(v, facts){
         if abs(f) >= 1.0 && d / abs(f) * 100.0 <= 1.0 { return true }
     }
     return false
+}
+
+// #33-1: why 里的时间/日期 token 先剥除,再对剩余数字对照事实。
+// 允许的时间集合:计划起止窗内整点(HH 与 H 两种写法)、改期目标日的同窗整点;
+// 允许的日期集合:计划日与改期目标日的 M/D、M、D;年份(2026)一并不算编造。
+fn resched_target(){
+    let next_t = ""
+    for i in 5 {
+        let cand = shift_date(g_date, i + 1)
+        if day_level(cand) != "高" { next_t = cand break }
+    }
+    return next_t
+}
+
+fn window_hours(){
+    let sh = g_start.split(":")[0].to_f64()
+    let span = ceil(g_dur / 60.0)
+    let out = []
+    for k in span + 1 {
+        let h = sh + k
+        if h > 23 { break }
+        out.push(h)
+    }
+    return out
+}
+
+fn strip_time_tokens(text){
+    // #33-1: 时间/日期 token 按字节区间整体豁免。捕获组路径不能用:
+    // match_all 的 captures 在多字节输入下触发 string.rs:795 的区间 panic
+    // (m6 最小探针实证,start 39 > end 37)——改用无捕获组正则 + 手工解析
+    // token 值(split/strip)取成分,再按 index/len 建豁免区间。
+    let dates = [g_date]
+    for i in 5 {
+        dates.push(shift_date(g_date, i + 1))
+    }
+    let d_ok = []
+    for ds in dates {
+        let parts = ds.split("-")
+        if parts.len() >= 3 {
+            d_ok.push([parts[1].to_f64(), parts[2].to_f64()])
+        }
+    }
+    let h_ok = window_hours()
+    let ranges = []
+    // HH:MM
+    let re_t = regex("[0-9]{1,2}:[0-9]{2}", "")
+    for m in text.match_all(re_t) {
+        let ps = m.value.split(":")
+        if ps.len() >= 2 {
+            let h = ps[0].to_f64()
+            if in_list(h_ok, h) { ranges.push({a: m.index, b: m.index + m.value.len()}) }
+        }
+    }
+    // H点 / H时
+    let re_h = regex("[0-9]{1,2}[点时]", "")
+    for m in text.match_all(re_h) {
+        let v = m.value.split("点")[0]
+        v = v.split("时")[0]
+        let h = v.to_f64()
+        if in_list(h_ok, h) { ranges.push({a: m.index, b: m.index + m.value.len()}) }
+    }
+    // M/D
+    let re_md = regex("[0-9]{1,2}/[0-9]{1,2}", "")
+    for m in text.match_all(re_md) {
+        let ps = m.value.split("/")
+        if ps.len() >= 2 {
+            let mo = ps[0].to_f64()
+            let da = ps[1].to_f64()
+            for pd in d_ok {
+                if pd[0] == mo && pd[1] == da { ranges.push({a: m.index, b: m.index + m.value.len()}) }
+            }
+        }
+    }
+    // M月D日
+    let re_mdc = regex("[0-9]{1,2}月[0-9]{1,2}日", "")
+    for m in text.match_all(re_mdc) {
+        let v = m.value.replace("月", "/")
+        let t2 = v.strip_suffix("日")
+        if t2 != nil {
+            let ps = t2.split("/")
+            if ps.len() >= 2 {
+                let mo = ps[0].to_f64()
+                let da = ps[1].to_f64()
+                for pd in d_ok {
+                    if pd[0] == mo && pd[1] == da { ranges.push({a: m.index, b: m.index + m.value.len()}) }
+                }
+            }
+        }
+    }
+    // 剩余数字:落在任一豁免区间内 → 跳过;否则对照因子值
+    let re = regex("[0-9]+[.]?[0-9]*", "")
+    let keep = []
+    for m in text.match_all(re) {
+        let v = m.value.to_f64()
+        if v >= 1000.0 { continue }
+        let na = m.index
+        let nb = m.index + m.value.len()
+        let hit = false
+        for rg in ranges {
+            if na >= rg.a && nb <= rg.b { hit = true break }
+        }
+        if hit { continue }
+        keep.push(v)
+    }
+    return keep
 }
 
 fn reply_nums(text){
@@ -1637,7 +1758,8 @@ fn agent_options_ok(text, facts){
         for c in op.checklist {
             if !in_list(vocab, c) { return {is_good: false why: "checklist 越词表:" + c} }
         }
-        for v in reply_nums(op.why) {
+        // #33-1: 先剥时间/日期 token,剩余数字才对照因子值
+        for v in strip_time_tokens(op.why) {
             if !num_ok(v, facts) { return {is_good: false why: "why 含事实外数字 " + v} }
         }
     }
@@ -1728,6 +1850,7 @@ fn agent_bad_note(technical){
 }
 
 fn agent_fallback(chan){
+    g_opt_pending = false
     if chan == "parse" {
         g_src_parse = "规则"
         g_parse()
@@ -1782,10 +1905,13 @@ fn agent_reply(chan, text){
             }
             g_note = agent_bad_note(v.why)
             g_agent_reject = true
+            g_opt_pending = false
+            g_step = 3   // #33: 拒绝后直达③——「改用规则」按钮所在页,提示才指得到
             render_guard()
             return
         }
         g_agent_bad = 0
+        g_opt_pending = false
         agent_ledger(chan, true, "")
         g_opts = agent_opts_to_g(v.opts)
         g_sel = 0
@@ -1820,7 +1946,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
             draw_text +: {color: ink color_hover: ink color_down: ink}}
     }
-    note_lbl := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
+    note_lbl := Label{visible: true width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
     panel := View{visible: false width: Fill height: Fit flow: Down spacing: 8
         View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             sbox := TextInput{width: Fill height: 36 empty_text: "搜索城市,如:成都 / 朝阳"
@@ -1855,7 +1981,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             }
         }}
     }
-    Hr{}
+    guard_hr := Hr{}
     home_page := View{width: Fill height: Fill flow: Down spacing: 10
     View{width: Fill height: Fit flow: Down spacing: 2
         temp_lbl := Label{text: "—" draw_text.color: ink draw_text.text_style: theme.font_bold{font_size: 54}}
@@ -1956,9 +2082,10 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
                         draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 8.0}
                         draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
                 }
-                ButtonFlat{text: "评估风险" height: 28 padding: Inset{left: 12 right: 12} on_click: || g_reassess()
+                g_assess_btn := ButtonFlat{text: "评估风险" height: 28 padding: Inset{left: 12 right: 12} on_click: || g_reassess()
                     draw_bg +: {border_radius: 18.0 color: #x34c759 color_hover: #x30b350 color_down: #x28a24a border_size: 0.0}
-                    draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
+                    draw_text +: {color: #xffffff color_hover: #ffffff color_down: #xffffff}}
+
             }
             g_nofc_lbl := Label{width: Fill height: Fit text: "" draw_text.color: secondary draw_text.text_style.font_size: 13}
         }
