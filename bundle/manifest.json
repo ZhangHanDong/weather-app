@@ -1,0 +1,12 @@
+{
+  "capabilities": [
+    "storage"
+  ],
+  "id": "trip-guardian",
+  "integrity": {
+    "bundle_blake3": "a17363da5733f52625a7dfac48fcd0203f6397a6b73d9eb434e143992c304f3c"
+  },
+  "name": "行程天气",
+  "schema": 1,
+  "version": "0.1.0"
+}
