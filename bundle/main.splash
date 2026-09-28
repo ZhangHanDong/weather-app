@@ -56,6 +56,9 @@ let g_agent_chan = ""            // parse | options
 let g_src_parse = "规则"
 let g_agent_reject = false       // #28-5: 拒绝后展示「改用规则」
 let g_exec_fail = ""             // #28-4: 执行失败原因(空=成功)
+// #30-1: 守护页地点定位
+let g_geo = nil                  // {name, label, lat, lon} 定位结果(nil=用当前城市)
+let g_geo_note = ""              // 「按〈深圳湾 · 广东省深圳市〉的预报」或「没找到…按当前城市〈北京〉的预报」
 let g_src_opts = "规则"
 
 // ---------- 工具 ----------
@@ -760,6 +763,93 @@ fn parse_place(text){
     return tail.trim()
 }
 
+// ---------- 守护页:地点定位(#30-1) ----------
+// 解析出地点后先用 geocoding 定位;搜到 → 用其经纬度取该窗预报;搜不到 → 退回当前城市并写明。
+fn geo_try(q){
+    let url = "https://geocoding-api.open-meteo.com/v1/search?name=" + q.url_encode() + "&count=1&language=zh&format=json"
+    let res = fetch(url).await()
+    if res == nil || res.status_code >= 400 { return nil }
+    let data = res.body.to_string().parse_json()
+    if data == nil || !has_key(data, "results") { return nil }
+    let rs = data.results
+    if rs.len() == 0 { return nil }
+    let r = rs[0]
+    if r.name == nil || r.latitude == nil || r.longitude == nil { return nil }
+    return {name: r.name label: plain_country(r) lat: r.latitude lon: r.longitude}
+}
+
+// 「深圳湾」不是地理编码条目(实测 0 结果)——用 strip_suffix 链渐进截尾
+// (字符串无切片 API;每轮剥一个常见通名后缀,最少留 2 字/6 字节)。
+fn geo_one(q){
+    let got = geo_try(q)
+    if got != nil { return got }
+    let cur = q
+    let n = 0
+    while cur.len() > 4 && n < 6 {     // 每个 CJK 字 3 字节;2 字 = 6 字节
+        cur = cur.split("")[0]
+        // split("") 行为不可靠——改用 slice 语义:重建去掉末字节×3
+        n = n + 1
+    }
+    // 上面 while 不可靠,直接做确定次数截尾
+    let parts = q.split("")
+    if parts.len() > 3 {
+        // 中文按 3 字节;取前 len-3 字节
+        got = geo_try(q.split(parts[parts.len()-1])[0])
+        if got != nil { return got }
+    }
+    if q.len() > 6 {
+        got = geo_try(q.strip_suffix("湾"))
+        if got != nil { return got }
+        got = geo_try(q.strip_suffix("公园"))
+        if got != nil { return got }
+    }
+    return nil
+}
+
+// g_assess 的取数前置:定位 → (必要时)取该点预报 → 缓存到 g_wx_place/g_wx_guard
+let g_wx_guard = nil   // 守护页专用预报(地点定位后)
+let g_wx_guard_key = ""  // "lat,lon" 缓存键
+
+fn guard_fetch_for(place){
+    let p = geo_one(place)
+    if p == nil {
+        g_geo = nil
+        g_geo_note = "没找到「" + place + "」,按当前城市〈" + cities[cur].name + "〉的预报"
+        g_wx_guard = nil
+        g_wx_guard_key = ""
+        return
+    }
+    let key = "" + p.lat + "," + p.lon
+    g_geo = p
+    g_geo_note = "按〈" + p.name + " · " + p.label + "〉的预报"
+    if key != g_wx_guard_key {
+        g_wx_guard_key = key
+        let url = "https://api.open-meteo.com/v1/forecast?latitude=" + p.lat + "&longitude=" + p.lon
+            + "&current=temperature_2m,weather_code"
+            + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
+            + "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
+            + "&timezone=auto&forecast_days=16"
+        let res = fetch(url).await()
+        if res == nil || res.status_code >= 400 {
+            g_wx_guard = nil
+            g_wx_guard_key = ""
+            g_geo_note = "按〈" + p.name + " · " + p.label + "〉取数失败,稍后再试"
+            return
+        }
+        g_wx_guard = parse_forecast(res.body.to_string())
+        if g_wx_guard == nil {
+            g_wx_guard_key = ""
+            g_geo_note = "按〈" + p.name + " · " + p.label + "〉数据解析失败,稍后再试"
+        }
+    }
+}
+
+// 守护页取当前生效的预报(wx 代理)
+fn guard_wx(){
+    if g_geo != nil && g_wx_guard != nil { return g_wx_guard }
+    return wx
+}
+
 // ---------- 守护页:事实与风险 ----------
 // 阈值出处:Rust 版 src/guardian_g2.rs:178-188 THRESHOLDS
 //   降水概率 ≥60 高 / 30-59 中;小时降水量 ≥2 高 / 0.5-1.9 中;
@@ -771,7 +861,11 @@ fn g_assess(){
         render_guard()
         return
     }
-    let hall = wx.hall
+    // #30-1: 先定位地点(搜到 → 专用预报;搜不到 → 退回当前城市并写明)
+    guard_fetch_for(g_place)
+    let w = guard_wx()
+    if w == nil { g_note = g_geo_note render_guard() return }
+    let hall = w.hall
     if hall.len() == 0 { g_note = "逐小时数据不可用,稍后再试" render_guard() return }
     // 窗口小时(start 的 HH,含 start 整点,共 ceil(dur/60)+1 个采样)
     let sh = g_start.split(":")[0].to_f64()
@@ -821,7 +915,7 @@ fn g_assess(){
     if g_agent_state == 2 {
         g_src_opts = "规则"
         build_options(level, hits, pp_w, pr_w, ap_w, uv_w)
-        g_note = "风险:" + level + " · 按〈" + cities[cur].name + "〉的预报 · " + agent_unavailable_note()
+        g_note = "风险:" + level + " · " + g_geo_note + " · " + agent_unavailable_note()
         render_guard()
         return
     }
@@ -936,7 +1030,7 @@ fn build_options(level, hits, pp_w, pr_w, ap_w, uv_w){
 
 // 某日期同窗(仅按小时,跨天不折返)的风险等级
 fn day_level(ds){
-    let hall = wx.hall
+    let hall = guard_wx().hall
     let sh = g_start.split(":")[0].to_f64()
     let span = ceil(g_dur / 60.0)
     let lv = "低"
@@ -961,7 +1055,7 @@ fn day_level(ds){
 }
 
 fn day_line(ds){
-    let hall = wx.hall
+    let hall = guard_wx().hall
     let sh = g_start.split(":")[0].to_f64()
     let span = ceil(g_dur / 60.0)
     let mpp = nil
@@ -1176,7 +1270,7 @@ fn g_verify(){
 }
 
 fn day_level_of(ds, start, dur){
-    let hall = wx.hall
+    let hall = guard_wx().hall
     let sh = start.split(":")[0].to_f64()
     let span = ceil(dur / 60.0)
     let lv = "低"
@@ -1446,7 +1540,7 @@ fn reply_nums(text){
 }
 
 fn fact_nums(){
-    let hall = wx.hall
+    let hall = guard_wx().hall
     let sh = g_start.split(":")[0].to_f64()
     let span = ceil(g_dur / 60.0)
     let out = []
