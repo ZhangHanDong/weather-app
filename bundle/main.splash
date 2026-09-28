@@ -1,53 +1,443 @@
-let notes = []
+// 行程天气(trip-guardian)S1:天气首页 + 城市面板。
+// 数据:Open-Meteo forecast(timezone=auto)+ geocoding;星期由当地日期字符串自算
+// (card-host 的 local_time() 是 UTC,不用)。列表渲染只走 on_render,不逐帧跑脚本。
 
-fn load(){
-    if fs.exists("notes.json") {
-        let v = fs.read("notes.json").parse_json()
-        if v != nil { notes = v }
+let DEFAULT_CITIES = [
+    {name: "深圳" country: "中国" lat: 22.54 lon: 114.06}
+    {name: "北京" country: "中国" lat: 39.9 lon: 116.41}
+    {name: "上海" country: "中国" lat: 31.23 lon: 121.47}
+    {name: "广州" country: "中国" lat: 23.13 lon: 113.26}
+    {name: "杭州" country: "中国" lat: 30.27 lon: 120.16}
+    {name: "成都" country: "中国" lat: 30.57 lon: 104.07}
+    {name: "香港" country: "中国" lat: 22.32 lon: 114.17}
+    {name: "台北" country: "中国台湾" lat: 25.03 lon: 121.57}
+]
+
+let cities = []
+let cur = 0
+let wx = nil
+let note = "加载中…"
+let loading = false
+let fetch_seq = 0
+let to_timer = nil
+let refresh_timer = nil
+let panel_open = false
+let query = ""
+let results = []
+let searching = false
+let search_note = ""
+
+// ---------- 工具 ----------
+
+// 缺字段访问是错误而不是 nil(Gotchas):先数键再取值。
+fn has_key(o, k){
+    for kk vv in o {
+        if kk == k { return true }
     }
-    ui.list.render()
-}
-fn save(){ fs.write("notes.json", notes.to_json()) }
-fn add(){
-    let text = ui.entry.text()
-    if text == "" { return }
-    notes.push(text)
-    ui.entry.set_text("")
-    save()
-    ui.list.render()
-}
-fn remove(i){
-    let kept = []
-    for j in notes.len() { if j != i { kept.push(notes[j]) } }
-    notes = kept
-    save()
-    ui.list.render()
+    return false
 }
 
-start_timeout(0.05, || load())
+fn int_str(v){
+    if v == nil { return "—" }
+    let r = round(v)
+    let s = "" + r
+    if s.search(".") >= 0 { s = s.split(".")[0] }
+    return s
+}
+
+fn deg(v){
+    if v == nil { return "—" }
+    return int_str(v) + "°"
+}
+
+fn wd_name(wi){
+    if wi == 0 { return "周日" }
+    if wi == 1 { return "周一" }
+    if wi == 2 { return "周二" }
+    if wi == 3 { return "周三" }
+    if wi == 4 { return "周四" }
+    if wi == 5 { return "周五" }
+    return "周六"
+}
+
+// "2026-09-29" → "9/29 周二"(星期自算,不依赖本地时区)
+fn short_date(ds){
+    let p = ds.split("-")
+    if p.len() < 3 { return ds }
+    let y = p[0].to_f64()
+    let m = p[1].to_f64()
+    let d = p[2].to_f64()
+    if !(y >= 0 && m >= 1 && d >= 1) { return ds }
+    let yy = y
+    let mm = m
+    if mm <= 2 {
+        yy = y - 1
+        mm = m + 12
+    }
+    let era = floor(yy / 400.0)
+    let yoe = yy - era * 400.0
+    let doy = floor((153.0 * (mm - 3.0) + 2.0) / 5.0) + d - 1.0
+    let doe = yoe * 365.0 + floor(yoe / 4.0) - floor(yoe / 100.0) + doy
+    let days = era * 146097.0 + doe - 719468.0
+    let wd = days - floor(days / 7.0) * 7.0
+    let wi = wd + 4.0
+    wi = wi - floor(wi / 7.0) * 7.0
+    return "" + m + "/" + d + " " + wd_name(wi)
+}
+
+// "2026-09-28T13:15" → "9/28 13:15"
+fn fmt_dt(iso){
+    if iso == nil { return "" }
+    let pt = iso.split("T")
+    if pt.len() < 2 { return iso }
+    let d = pt[0].split("-")
+    if d.len() < 3 { return iso }
+    let m = d[1].to_f64()
+    let day = d[2].to_f64()
+    if !(m >= 1 && day >= 1) { return iso }
+    return "" + m + "/" + day + " " + pt[1]
+}
+
+fn wmo_zh(code){
+    if code == nil { return "—" }
+    if code == 0 { return "晴" }
+    if code == 1 { return "基本晴" }
+    if code == 2 { return "局部多云" }
+    if code == 3 { return "阴" }
+    if code == 45 || code == 48 { return "雾" }
+    if code >= 51 && code <= 57 { return "毛毛雨" }
+    if code >= 61 && code <= 67 { return "雨" }
+    if code >= 71 && code <= 77 { return "雪" }
+    if code >= 80 && code <= 82 { return "阵雨" }
+    if code == 85 || code == 86 { return "阵雪" }
+    if code >= 95 { return "雷雨" }
+    return "—"
+}
+
+// ---------- 存储 ----------
+
+fn save_cities(){ fs.write("cities.json", {list: cities sel: cur}.to_json()) }
+
+fn load_cities(){
+    cities = []
+    for c in DEFAULT_CITIES { cities.push(c) }
+    cur = 0
+    if fs.exists("cities.json") {
+        let v = fs.read("cities.json").parse_json()
+        if v != nil && v.list != nil && v.list.len() > 0 {
+            let got = []
+            for c in v.list {
+                if c.name != nil && c.lat != nil && c.lon != nil {
+                    let co = c.country
+                    if co == nil { co = "" }
+                    got.push({name: c.name country: co lat: c.lat lon: c.lon})
+                }
+            }
+            if got.len() > 0 { cities = got }
+            if v.sel != nil { cur = v.sel }
+        }
+    }
+    if cur >= cities.len() { cur = 0 }
+}
+
+// ---------- 取数 ----------
+
+fn fetch(url){
+    let p = promise()
+    net.http_request(net.HttpRequest{url: url method: net.HttpMethod.GET headers: {"User-Agent": "TripGuardian/0.1"}}) do net.HttpEvents{
+        on_response: |res| p.resolve(res)
+        on_error: |_err| p.resolve(nil)
+    }
+    p
+}
+
+fn forecast_url(c){
+    return "https://api.open-meteo.com/v1/forecast?latitude=" + c.lat + "&longitude=" + c.lon
+        + "&current=temperature_2m,weather_code"
+        + "&hourly=temperature_2m,precipitation_probability"
+        + "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
+        + "&timezone=auto&forecast_days=10"
+}
+
+// "2026-09-28T13:15" → "2026-09-28T13:"(逐小时数组里找当前小时的锚)
+fn hour_prefix(iso){
+    let pt = iso.split("T")
+    if pt.len() < 2 { return "" }
+    let hm = pt[1].split(":")
+    if hm.len() < 1 { return "" }
+    return pt[0] + "T" + hm[0] + ":"
+}
+
+fn parse_forecast(body){
+    let data = body.parse_json()
+    if data == nil { return nil }
+    if !has_key(data, "current") { return nil }
+    let ctm = data.current.time
+    if ctm == nil { return nil }
+    let hours = []
+    if has_key(data, "hourly") && has_key(data.hourly, "time") {
+        let ht = data.hourly.time
+        let prefix = hour_prefix(ctm)
+        let start = 0
+        if prefix != "" {
+            for i in ht.len() {
+                if ht[i].search(prefix) == 0 { start = i break }
+            }
+        }
+        for k in 24 {
+            let j = start + k
+            if j >= ht.len() { break }
+            let pt = ht[j].split("T")
+            let hh = ""
+            if pt.len() >= 2 { hh = pt[1].split(":")[0] }
+            hours.push({h: hh t: data.hourly.temperature_2m[j] p: data.hourly.precipitation_probability[j]})
+        }
+    }
+    let days = []
+    if has_key(data, "daily") && has_key(data.daily, "time") {
+        let dt = data.daily.time
+        for j in dt.len() {
+            if j >= 10 { break }
+            days.push({ds: dt[j] hi: data.daily.temperature_2m_max[j] lo: data.daily.temperature_2m_min[j] code: data.daily.weather_code[j] pp: data.daily.precipitation_probability_max[j]})
+        }
+    }
+    let hi = nil
+    let lo = nil
+    if days.len() > 0 { hi = days[0].hi lo = days[0].lo }
+    return {temp: data.current.temperature_2m code: data.current.weather_code time: ctm hi: hi lo: lo hours: hours days: days}
+}
+
+// 15 秒超时:到点仍无响应 → 作废这轮,保留上次成功数据并提示
+fn on_fetch_timeout(seq){
+    if seq != fetch_seq { return }
+    fetch_seq = fetch_seq + 1
+    loading = false
+    if wx == nil {
+        note = "加载超时(15 秒),还没有可用数据"
+    } else {
+        note = "加载超时(15 秒),显示上次成功数据 · " + fmt_dt(wx.time)
+    }
+    render_home()
+}
+
+fn refresh(){
+    if loading { return }
+    if cities.len() == 0 { return }
+    loading = true
+    fetch_seq = fetch_seq + 1
+    let seq = fetch_seq
+    note = "加载中…"
+    render_home()
+    to_timer = start_timeout(15.0, || on_fetch_timeout(seq))
+    let res = fetch(forecast_url(cities[cur])).await()
+    stop_timer(to_timer)
+    if seq != fetch_seq { return }
+    loading = false
+    if res == nil || res.status_code >= 400 {
+        if wx == nil { note = "取数失败,稍后自动重试" }
+        else { note = "取数失败,显示上次成功数据 · " + fmt_dt(wx.time) }
+        render_home()
+        return
+    }
+    let parsed = parse_forecast(res.body.to_string())
+    if parsed == nil {
+        if wx == nil { note = "数据解析失败,稍后自动重试" }
+        else { note = "数据解析失败,显示上次成功数据 · " + fmt_dt(wx.time) }
+        render_home()
+        return
+    }
+    wx = parsed
+    note = "已更新 · " + fmt_dt(wx.time)
+    render_home()
+}
+
+// ---------- 渲染 ----------
+
+fn render_home(){
+    if wx == nil {
+        ui.temp_lbl.set_text("—")
+        ui.cond_lbl.set_text("暂无数据")
+        ui.hilo_lbl.set_text("")
+    } else {
+        ui.temp_lbl.set_text(deg(wx.temp))
+        ui.cond_lbl.set_text(wmo_zh(wx.code))
+        ui.hilo_lbl.set_text("最高 " + deg(wx.hi) + " · 最低 " + deg(wx.lo))
+    }
+    ui.note_lbl.set_text(note)
+    ui.hours_strip.render()
+    ui.days_list.render()
+}
+
+// ---------- 城市面板 ----------
+
+fn render_panel(){
+    ui.search_note.set_text(search_note)
+    ui.result_rows.render()
+    ui.city_rows.render()
+}
+
+fn open_panel(){
+    panel_open = true
+    ui.panel.set_visible(true)
+    render_panel()
+}
+
+fn close_panel(){
+    panel_open = false
+    ui.panel.set_visible(false)
+}
+
+fn toggle_panel(){
+    if panel_open { close_panel() } else { open_panel() }
+}
+
+fn geo_label(r){
+    let parts = []
+    if has_key(r, "admin1") && r.admin1 != nil && r.admin1 != "" { parts.push(r.admin1) }
+    if has_key(r, "country") && r.country != nil && r.country != "" { parts.push(r.country) }
+    if parts.len() == 0 { return "—" }
+    let s = parts[0]
+    if parts.len() >= 2 { s = s + " · " + parts[1] }
+    return s
+}
+
+fn do_search(text){
+    query = text.trim()
+    if query == "" { return }
+    results = []
+    searching = true
+    search_note = "搜索中…"
+    render_panel()
+    let url = "https://geocoding-api.open-meteo.com/v1/search?name=" + query.url_encode() + "&count=10&language=zh&format=json"
+    let res = fetch(url).await()
+    searching = false
+    if res == nil || res.status_code >= 400 {
+        search_note = "搜索失败,请稍后再试"
+        render_panel()
+        return
+    }
+    let data = res.body.to_string().parse_json()
+    let got = []
+    if data != nil && has_key(data, "results") {
+        for r in data.results {
+            if r.name == nil || r.latitude == nil || r.longitude == nil { continue }
+            got.push({name: r.name country: geo_label(r) lat: r.latitude lon: r.longitude})
+        }
+    }
+    results = got
+    if results.len() == 0 {
+        search_note = "找不到「" + query + "」,换个说法试试"
+    } else {
+        search_note = "" + results.len() + " 个候选,点击选择"
+    }
+    render_panel()
+}
+
+fn pick_hit(h){
+    let dup = -1
+    for i in cities.len() {
+        if cities[i].name == h.name && abs(cities[i].lat - h.lat) < 0.01 && abs(cities[i].lon - h.lon) < 0.01 { dup = i }
+    }
+    if dup >= 0 { select_city(dup) return }
+    cities.push({name: h.name country: h.country lat: h.lat lon: h.lon})
+    select_city(cities.len() - 1)
+}
+
+fn select_city(i){
+    if i >= cities.len() { return }
+    cur = i
+    save_cities()
+    ui.city_btn.set_text(cities[cur].name + " ▾")
+    close_panel()
+    refresh()
+}
+
+// ---------- 启动 ----------
+
+fn boot(){
+    load_cities()
+    ui.city_btn.set_text(cities[cur].name + " ▾")
+    refresh()
+    if refresh_timer == nil { refresh_timer = start_interval(900.0, || refresh()) }
+}
+
+start_timeout(0.05, || boot())
 
 let ink = #x1c1c1e
 let secondary = #x8e8e93
-SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 12 draw_bg.color: #xffffff
-    Label{text: "\u884c\u7a0b\u5929\u6c14" draw_text.color: ink draw_text.text_style: theme.font_bold{font_size: 28}}
+let hairline = #xe5e5ea
+SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.color: #xffffff
     View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-        entry := TextInput{width: Fill height: 40 empty_text: "Write a note"
-            draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 10.0}
-            draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
-        ButtonFlat{text: "Add" height: 40 padding: Inset{left: 18 right: 18} on_click: || add()
-            draw_bg +: {border_radius: 20.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
-            draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
+        Label{text: "行程天气" draw_text.color: ink draw_text.text_style: theme.font_bold{font_size: 22}}
+        city_btn := ButtonFlat{text: "深圳 ▾" height: 36 padding: Inset{left: 14 right: 14} on_click: || toggle_panel()
+            draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
+            draw_text +: {color: ink color_hover: ink color_down: ink}}
+        note_lbl := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
     }
-    list := ScrollYView{width: Fill height: Fill flow: Down spacing: 8 on_render: || {
-        if notes.len() == 0 {
-            Label{text: "No notes yet." draw_text.color: secondary}
+    panel := View{visible: false width: Fill height: Fit flow: Down spacing: 8
+        View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            sbox := TextInput{width: Fill height: 36 empty_text: "搜索城市,如:成都 / 朝阳"
+                on_return: |text| do_search(text)
+                draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 18.0}
+                draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
+            ButtonFlat{text: "搜索" height: 36 padding: Inset{left: 14 right: 14} on_click: || do_search(ui.sbox.text())
+                draw_bg +: {border_radius: 18.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
+                draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
         }
-        for i in notes.len() {
-            GestureView{width: Fill height: Fit padding: 12 on_tap: |x, y| remove(i)
-                Label{width: Fill text: notes[i] draw_text.color: ink draw_text.text_style.font_size: 15}
+        search_note := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
+        result_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
+            for h in results {
+                GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| pick_hit(h)
+                    View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                        Label{text: h.name draw_text.color: ink draw_text.text_style.font_size: 15}
+                        Label{width: Fill text: h.country draw_text.color: secondary draw_text.text_style.font_size: 11}
+                    }
+                }
             }
-            Hr{}
+        }}
+        Hr{}
+        Label{text: "已保存的城市" draw_text.color: secondary draw_text.text_style.font_size: 11}
+        city_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
+            for i c in cities {
+                GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| select_city(i)
+                    View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                        Label{text: (if i == cur { "▶ " } else { "   " }) + c.name draw_text.color: ink draw_text.text_style.font_size: 15}
+                        Label{width: Fill text: c.country draw_text.color: secondary draw_text.text_style.font_size: 11}
+                    }
+                }
+            }
+        }}
+    }
+    Hr{}
+    View{width: Fill height: Fit flow: Down spacing: 2
+        temp_lbl := Label{text: "—" draw_text.color: ink draw_text.text_style: theme.font_bold{font_size: 54}}
+        cond_lbl := Label{text: "" draw_text.color: ink draw_text.text_style.font_size: 16}
+        hilo_lbl := Label{text: "" draw_text.color: secondary draw_text.text_style.font_size: 13}
+    }
+    Label{text: "未来 24 小时 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
+    hours_strip := ScrollXView{width: Fill height: Fit flow: Right spacing: 16 on_render: || {
+        if wx == nil { Label{text: "暂无数据" draw_text.color: secondary draw_text.text_style.font_size: 12} }
+        else {
+            for h in wx.hours {
+                View{width: Fit height: Fit flow: Down spacing: 2 align: Align{x: 0.5}
+                    Label{text: h.h + "时" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                    Label{text: deg(h.t) draw_text.color: ink draw_text.text_style.font_size: 15}
+                    Label{text: "降水 " + int_str(h.p) + "%" draw_text.color: secondary draw_text.text_style.font_size: 10}
+                }
+            }
         }
     }}
-    Label{text: "Tap a note to remove it." draw_text.color: secondary draw_text.text_style.font_size: 12}
+    Label{text: "10 天预报 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
+    days_list := ScrollYView{width: Fill height: Fill flow: Down spacing: 8 on_render: || {
+        if wx == nil { Label{text: "暂无数据" draw_text.color: secondary draw_text.text_style.font_size: 12} }
+        else {
+            for d in wx.days {
+                View{width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                    Label{width: 84 text: short_date(d.ds) draw_text.color: ink draw_text.text_style.font_size: 14}
+                    Label{width: Fill text: wmo_zh(d.code) + " · 降水 " + int_str(d.pp) + "%" draw_text.color: secondary draw_text.text_style.font_size: 13}
+                    Label{text: deg(d.hi) + " / " + deg(d.lo) draw_text.color: ink draw_text.text_style.font_size: 14}
+                }
+            }
+        }
+    }}
 }

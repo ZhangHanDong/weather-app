@@ -1,12 +1,19 @@
 {
   "capabilities": [
+    "net",
     "storage"
   ],
   "id": "trip-guardian",
   "integrity": {
-    "bundle_blake3": "a17363da5733f52625a7dfac48fcd0203f6397a6b73d9eb434e143992c304f3c"
+    "bundle_blake3": "0b9d788de6f4a383157ab903db80b46af19847eb1662960ccf5ab65e5760991c"
   },
   "name": "行程天气",
+  "network": {
+    "hosts": [
+      "api.open-meteo.com",
+      "geocoding-api.open-meteo.com"
+    ]
+  },
   "schema": 1,
   "version": "0.1.0"
 }
