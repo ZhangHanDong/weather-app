@@ -47,6 +47,14 @@ let g_plans = []                 // 行程簿
 let g_ledger = []                // 执行台账
 let g_last_action_id = ""        // 幂等判重键
 let g_verify_line = ""
+// S3 agent 通路(#26):探测/回退/校验状态
+let g_agent_state = 0            // 0 未探测 1 可用 2 不可用
+let g_agent_bad = 0              // 连续不合规次数
+let g_agent_pending = false
+let g_agent_timer = nil
+let g_agent_chan = ""            // parse | options
+let g_src_parse = "规则"
+let g_src_opts = "规则"
 
 // ---------- 工具 ----------
 
@@ -177,7 +185,7 @@ fn forecast_url(c){
         + "&current=temperature_2m,weather_code"
         + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
         + "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
-        + "&timezone=auto&forecast_days=10"
+        + "&timezone=auto&forecast_days=16"
 }
 
 // "2026-09-28T13:15" → "2026-09-28T13:"(逐小时数组里找当前小时的锚)
@@ -492,10 +500,10 @@ fn g_parse(){
     let today = today_str()
     if today == "" { g_note = "天气数据还没就绪,稍等再试" return }
     let pdate = ""
-    // 相对日
+    // 相对日(今晚/今早/明早/明晚 也锚定日期)
     if text.search("后天") >= 0 { pdate = shift_date(today, 2) }
-    elif text.search("明天") >= 0 { pdate = shift_date(today, 1) }
-    elif text.search("今天") >= 0 { pdate = today }
+    elif text.search("明早") >= 0 || text.search("明晚") >= 0 || text.search("明天") >= 0 { pdate = shift_date(today, 1) }
+    elif text.search("今晚") >= 0 || text.search("今早") >= 0 || text.search("今天") >= 0 { pdate = today }
     // 周X
     if pdate == "" {
         let names = ["周日","周一","周二","周三","周四","周五","周六"]
@@ -592,7 +600,7 @@ fn fmt_hm(h, m){
 // "9 点/9:30/09:00" → {h,m};上下午前缀换算
 fn parse_hhmm(text){
     let t = text
-    let pm = t.search("下午") >= 0 || t.search("晚上") >= 0 || t.search("傍晚") >= 0
+    let pm = t.search("下午") >= 0 || t.search("晚上") >= 0 || t.search("傍晚") >= 0 || t.search("今晚") >= 0 || t.search("明晚") >= 0
     let rg = regex("([0-9]{1,2})[:点时]([0-9]{2})", "")
     let m = rg.exec(t)
     if m != nil && m.captures.len() >= 3 {
@@ -610,7 +618,7 @@ fn parse_hhmm(text){
         if h >= 24.0 { return nil }
         // 「3点半」:命中点位的紧后是「半」→ :30
         let idx_half = t.search("半")
-        if idx_half >= 0 && idx_half - m2.index >= 0 && idx_half - m2.index <= 6 { return [h, 30.0] }
+        if idx_half >= 0 && idx_half - m2.index >= 0 && idx_half - m2.index <= 10 { return [h, 30.0] }
         return [h, 0.0]
     }
     return nil
@@ -619,16 +627,20 @@ fn parse_hhmm(text){
 // 「九点」「上午九点」中文数字 1-12 + 可选「半」
 fn parse_cn_hour(text){
     let t = text
-    let pm = t.search("下午") >= 0 || t.search("晚上") >= 0 || t.search("傍晚") >= 0
+    let pm = t.search("下午") >= 0 || t.search("晚上") >= 0 || t.search("傍晚") >= 0 || t.search("今晚") >= 0 || t.search("明晚") >= 0
+    // 「今晚/明晚」里的「晚」不是 pm 信号本身,先剥掉再找点数
+    let t2 = t
+    if t.search("今晚") >= 0 { t2 = t.replace("今晚", "X") }
+    let pm2 = t2.search("下午") >= 0 || t2.search("晚上") >= 0 || t2.search("傍晚") >= 0
     let cands = [["一",1.0],["二",2.0],["两",2.0],["三",3.0],["四",4.0],["五",5.0],["六",6.0],["七",7.0],["八",8.0],["九",9.0],["十",2.0]]
     for c in cands {
         let idx = t.search(c[0] + "点")
         if idx >= 0 {
             let h = c[1]
             if c[0] == "十" { h = 10.0 }
-            if pm && h < 12.0 { h = h + 12.0 }
+            if (pm || pm2) && h < 12.0 { h = h + 12.0 }
             if h >= 24.0 { return nil }
-            if t.search("半") >= 0 && t.search("半") - idx < 4 { return [h, 30.0] }
+            if t.search("半") >= 0 && t.search("半") - idx <= 10 { return [h, 30.0] }
             return [h, 0.0]
         }
     }
@@ -676,6 +688,9 @@ fn parse_dur(text){
         let h = m.captures[1].to_f64()
         if h >= 1.0 && h <= 12.0 { return round(h * 60.0) }
     }
+    // 「一个半小时」90 /「一个小时」「一个钟」60 /「一个半钟头」90
+    if text.search("一个半") >= 0 { return 90 }
+    if text.search("一个小时") >= 0 || text.search("一个钟") >= 0 { return 60 }
     if text.search("两小时") >= 0 || text.search("两个小时") >= 0 { return 120 }
     if text.search("半天") >= 0 { return 240 }
     if text.search("半小时") >= 0 { return 30 }
@@ -692,7 +707,9 @@ fn parse_place(text){
     let i = text.search("去")
     if i < 0 { return "" }
     // 「去」之后到第一个活动词/句尾
-    let stops = ["看日出","看日落","看海","逛街","游泳","骑车","骑行","爬山","跑步","徒步","露营","野餐","散步","拍照","玩水","钓鱼"]
+    let stops = ["看日出","看日落","看海","逛街","游泳","骑车","骑行","爬山","跑步","徒步","露营","野餐","散步","拍照","玩水","钓鱼","放风筝"]
+    // 兜底:地点 2-4 字,遇常见动词字截断(放/看/吃/玩/逛/跑/骑/爬/拍/钓)
+    let verbs = ["放","看","吃","玩","逛","跑","骑","爬","拍","钓"]
     let tail = text
     for st in stops {
         let m = regex("去([一-龥A-Za-z0-9]+)" + st, "").exec(text)
@@ -716,6 +733,16 @@ fn parse_place(text){
                 break
             }
         }
+    }
+    // 动词字兜底(#26-5):从 tail 第一个常见动词字起截断(「莲花山放风筝」→「莲花山」)
+    let cut = -1
+    let win_v = ""
+    for v in verbs {
+        let vi = tail.search(v)
+        if vi >= 0 && (cut < 0 || vi < cut) { cut = vi win_v = v }
+    }
+    if cut > 1 {
+        tail = tail.split(win_v)[0]
     }
     return tail.trim()
 }
@@ -777,10 +804,18 @@ fn g_assess(){
     g_risk_line = hit_line(rows, hits)
     g_risk_src = "Open-Meteo · 数据时间 " + fmt_dt(wx.time)
     g_facts_ok = true
-    build_options(level, hits, pp_w, pr_w, ap_w, uv_w)
     g_stage = 2
-    g_note = "风险:" + level + " · 按〈" + cities[cur].name + "〉的预报"
+    if g_agent_state == 2 {
+        g_src_opts = "规则"
+        build_options(level, hits, pp_w, pr_w, ap_w, uv_w)
+        g_note = "风险:" + level + " · 按〈" + cities[cur].name + "〉的预报 · " + agent_unavailable_note()
+        render_guard()
+        return
+    }
+    g_note = "风险:" + level + " · 正在请 agent 给方案…"
     render_guard()
+    let prompt = "计划窗口风险等级:" + level + "。事实(窗内最差值,数据时间 " + fmt_dt(wx.time) + "):" + g_risk_line + "。请只回 JSON:{options:[{action,why,checklist[]}]},1-3 项;action 只能是 reschedule/mark_indoor/add_checklist/keep 之一;checklist 只能来自 [雨具,补水,保暖衣物,防晒];why 里的每个数字必须来自上面事实;不得含 URL。"
+    agent_ask("options", prompt)
 }
 
 // rows 里某字段的最差(最大)值
@@ -1097,7 +1132,18 @@ fn del_plan(i){
 
 fn g_start_input(text){
     g_input = text
-    g_parse()
+    if g_agent_state == 2 {
+        g_src_parse = "规则"
+        g_parse()
+        g_note = agent_unavailable_note() + " · " + g_note
+        render_guard()
+        return
+    }
+    g_note = "正在请 agent 解析…"
+    render_guard()
+    let today = today_str()
+    let prompt = "今天是 " + today + "(YYYY-MM-DD)。请只回 JSON,字段固定为 {place,date,start,duration_min,missing[]}:place 是地点标签(2-6 字,不含活动词),date 是 YYYY-MM-DD,start 是 HH:MM(24 小时制),duration_min 是分钟数(15-720),missing 是缺失项数组(地点/时间)。用户原话:" + text
+    agent_ask("parse", prompt)
 }
 
 // 解析卡读回(编辑生效):short_date 反解日期,HH:MM/分钟读回
@@ -1155,6 +1201,8 @@ fn back_home(){
 
 fn render_guard(){
     ui.g_note_lbl.set_text(g_note)
+    ui.g_parse_src.set_text("解析卡(来源:" + g_src_parse + " · 可修改后重新评估)")
+    ui.g_opt_src.set_text("方案卡(来源:" + g_src_opts + " · 单击选择)")
     ui.g_parse_card.set_visible(g_stage >= 1)
     if g_stage >= 1 {
         ui.g_place_box.set_text(g_place)
@@ -1176,6 +1224,275 @@ fn render_guard(){
     ui.g_verify_line.set_visible(g_verify_line != "")
     ui.g_verify_line.set_text(g_verify_line)
     ui.g_plan_rows.render()
+}
+
+
+// ---------- S3:agent 通路(octos.session.open / octos.turn.start) ----------
+// 原则:模型只写理解和方案,不写事实;执行与核验不经过模型(沿用 S2)。
+// 协议出处:docs/AI-SERVICES.md「A minimal call」+ HOST-SERVICES.md
+// (card-host 无 octos 服务,host.request 立即回 no service answers,不挂起)。
+
+fn agent_ledger(chan, good, reason){
+    let seq = ledger_seq()
+    let d = "不合规:" + reason
+    if good { d = "合规采用" }
+    g_ledger.push({seq: seq at: fmt_dt(wx.time) kind: "agent" action_id: chan detail: d})
+    save_ledger()
+}
+
+fn agent_unavailable_note(){
+    return "agent 不可用,方案由规则给出"
+}
+
+// 30 秒超时:回调未至 → 视为不可用,回退规则(#26-6)
+fn agent_timeout(){
+    if !g_agent_pending { return }
+    g_agent_pending = false
+    if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
+    g_agent_state = 2
+    agent_ledger(g_agent_chan, false, "30 秒无响应")
+    if g_agent_chan == "parse" {
+        g_parse()
+        g_note = agent_unavailable_note()
+        render_guard()
+    } else {
+        g_opts = []
+        build_options(g_risk_level, [], nil, nil, nil, nil)
+        g_src_opts = "规则"
+        g_note = "风险:" + g_risk_level + " · " + agent_unavailable_note()
+        render_guard()
+    }
+}
+
+// 数字校验:why 里的每个数字都要能在事实里找到(±0.5 或 ±1%)(#26-4)
+fn num_ok(v, facts){
+    for f in facts {
+        let d = abs(v - f)
+        if d <= 0.5 { return true }
+        if abs(f) >= 1.0 && d / abs(f) * 100.0 <= 1.0 { return true }
+    }
+    return false
+}
+
+fn reply_nums(text){
+    // str.match_all(pat)(string.rs:374):pat 必须是 regex 对象(非模式字符串)
+    let out = []
+    let re = regex("[0-9]+[.]?[0-9]*", "")
+    let ms = text.match_all(re)
+    for m in ms {
+        let v = m.value.to_f64()
+        if v >= 0.0 { out.push(v) }
+    }
+    return out
+}
+
+fn fact_nums(){
+    let hall = wx.hall
+    let sh = g_start.split(":")[0].to_f64()
+    let span = ceil(g_dur / 60.0)
+    let out = []
+    for k in span + 1 {
+        let h = sh + k
+        if h > 23 { break }
+        for r in hall {
+            if r.ds == g_date && r.h.to_f64() == h {
+                if r.p != nil { out.push(r.p) }
+                if r.pr != nil { out.push(r.pr) }
+                if r.ap != nil { out.push(r.ap) }
+                if r.ws != nil { out.push(r.ws) }
+                if r.uv != nil { out.push(r.uv) }
+                out.push(h)
+                break
+            }
+        }
+    }
+    out.push(g_dur)
+    return out
+}
+
+// 回复总检:不能带 URL
+fn reply_has_url(text){
+    return text.search("http") >= 0
+}
+
+// 解析回复校验:只允许 {place,date,start,duration_min,missing}
+fn agent_parse_ok(text){
+    if reply_has_url(text) { return {is_good: false why: "回复含 URL"} }
+    let o = text.parse_json()
+    if o == nil { return {is_good: false why: "不是合规 JSON"} }
+    let want = ["place","date","start","duration_min","missing"]
+    for k in want {
+        if !has_key(o, k) { return {is_good: false why: "缺字段 " + k} }
+    }
+    let n = 0
+    for k v in o { n = n + 1 }
+    if n != 5 { return {is_good: false why: "有多余字段"} }
+    let dr = regex("[0-9]{4}-[0-9]{2}-[0-9]{2}", "")
+    if !dr.test(o.date) { return {is_good: false why: "date 非 YYYY-MM-DD"} }
+    let tr = regex("[0-9]{2}:[0-9]{2}", "")
+    if !tr.test(o.start) { return {is_good: false why: "start 非 HH:MM"} }
+    let du = o.duration_min
+    if !(du >= 15.0 && du <= 720.0) { return {is_good: false why: "duration_min 越界或非数字"} }
+    return {is_good: true o: o}
+}
+
+// 方案回复校验:{options:[{action,why,checklist}]},1-3 项,四条规则全查
+fn agent_options_ok(text, facts){
+    if reply_has_url(text) { return {is_good: false why: "回复含 URL"} }
+    let o = text.parse_json()
+    if o == nil { return {is_good: false why: "不是合规 JSON"} }
+    if !has_key(o, "options") { return {is_good: false why: "缺 options"} }
+    let n = 0
+    for k v in o { n = n + 1 }
+    if n != 1 { return {is_good: false why: "有多余字段"} }
+    let opts = o.options
+    if opts.len() < 1 || opts.len() > 3 { return {is_good: false why: "options 数量 1-3"} }
+    let acts = ["reschedule","mark_indoor","add_checklist","keep"]
+    let vocab = ["雨具","补水","保暖衣物","防晒"]
+    for op in opts {
+        let m = 0
+        for k v in op { m = m + 1 }
+        if m != 3 { return {is_good: false why: "option 有多余/缺失字段"} }
+        if !in_list(acts, op.action) { return {is_good: false why: "action 非法:" + op.action} }
+        for c in op.checklist {
+            if !in_list(vocab, c) { return {is_good: false why: "checklist 越词表:" + c} }
+        }
+        for v in reply_nums(op.why) {
+            if !num_ok(v, facts) { return {is_good: false why: "why 含事实外数字 " + v} }
+        }
+    }
+    return {is_good: true opts: opts}
+}
+
+// agent 方案 → g_opts(执行参数由代码定,不取自模型)
+fn agent_opts_to_g(opts){
+    let out = []
+    let ids = ["A","B","C"]
+    let resched_label = ""
+    let next = ""
+    for i in 5 {
+        let cand = shift_date(g_date, i + 1)
+        if day_level(cand) != "高" { next = cand break }
+    }
+    if next != "" { resched_label = "改期到 " + short_date(next) + " " + g_start }
+    for i op in opts {
+        let label = op.why
+        if op.action == "reschedule" && resched_label != "" { label = resched_label }
+        if op.action == "mark_indoor" { label = "改为室内" }
+        if op.action == "keep" { label = "保持原计划" }
+        if op.action == "add_checklist" {
+            let items = ""
+            for c in op.checklist {
+                if items != "" { items = items + "、" }
+                items = items + c
+            }
+            label = "携带:" + items
+        }
+        out.push({id: ids[i] act: op.action label: label why: op.why})
+    }
+    return out
+}
+
+// 统一入口:先 session.open,再 turn.start;回包走校验
+fn agent_ask(chan, prompt){
+    if g_agent_state == 2 {
+        agent_fallback(chan)
+        return
+    }
+    g_agent_chan = chan
+    g_agent_pending = true
+    g_agent_timer = start_timeout(30.0, || agent_timeout())
+    host.request("octos.session.open", {}, fn(sess){
+        if !sess.is_ok {
+            g_agent_state = 2
+            g_agent_pending = false
+            if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
+            agent_ledger(chan, false, "session.open:" + sess.error)
+            agent_fallback(chan)
+            return
+        }
+        host.request("octos.turn.start", {text: prompt}, fn(r){
+            g_agent_pending = false
+            if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
+            if !r.is_ok {
+                g_agent_state = 2
+                agent_ledger(chan, false, "turn.start:" + r.error)
+                agent_fallback(chan)
+                return
+            }
+            g_agent_state = 1
+            agent_reply(chan, r.data.text)
+        })
+    })
+}
+
+fn agent_fallback(chan){
+    if chan == "parse" {
+        g_src_parse = "规则"
+        g_parse()
+        g_note = agent_unavailable_note() + " · " + g_note
+        render_guard()
+    } else {
+        g_src_opts = "规则"
+        build_options(g_risk_level, [], nil, nil, nil, nil)
+        g_note = "风险:" + g_risk_level + " · " + agent_unavailable_note()
+        render_guard()
+    }
+}
+
+fn agent_reply(chan, text){
+    if chan == "parse" {
+        let v = agent_parse_ok(text)
+        if !v.is_good {
+            g_agent_bad = g_agent_bad + 1
+            agent_ledger(chan, false, v.why)
+            agent_fallback(chan)
+            return
+        }
+        g_agent_bad = 0
+        agent_ledger(chan, true, "")
+        let o = v.o
+        g_place = o.place
+        g_date = o.date
+        g_start = o.start
+        g_dur = round(o.duration_min)
+        g_stage = 1
+        g_no_forecast = ""
+        g_verify_line = ""
+        g_src_parse = "agent"
+        let miss = o.missing
+        if miss.len() > 0 {
+            g_note = "agent 解析缺:" + join_list(miss) + " · 请在解析卡补全后再评估"
+        } else {
+            g_note = "agent 已解析 · 按「评估风险」继续"
+        }
+        render_guard()
+    } else {
+        let facts = fact_nums()
+        let v = agent_options_ok(text, facts)
+        if !v.is_good {
+            g_agent_bad = g_agent_bad + 1
+            agent_ledger(chan, false, v.why)
+            if g_agent_bad >= 2 {
+                g_note = "agent 连续两次不合规(" + v.why + "),已改用规则方案"
+                agent_fallback(chan)
+                g_note = "agent 连续两次不合规(" + v.why + "),已改用规则方案"
+                render_guard()
+                return
+            }
+            g_note = "agent 回复不合规(" + v.why + "),重试或回退规则"
+            render_guard()
+            return
+        }
+        g_agent_bad = 0
+        agent_ledger(chan, true, "")
+        g_opts = agent_opts_to_g(v.opts)
+        g_sel = 0
+        g_src_opts = "agent"
+        g_stage = 2
+        g_note = "风险:" + g_risk_level + " · 方案来自 agent(单击选择)"
+        render_guard()
+    }
 }
 
 // ---------- 启动 ----------
@@ -1291,7 +1608,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
         g_note_lbl := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
         ScrollYView{width: Fill height: Fill flow: Down spacing: 10
             g_parse_card := View{visible: false width: Fill height: Fit flow: Down spacing: 6
-                Label{text: "解析卡(可修改后重新评估)" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                g_parse_src := Label{text: "解析卡(来源:规则 · 可修改后重新评估)" draw_text.color: secondary draw_text.text_style.font_size: 11}
                 View{width: Fill height: Fit flow: Right spacing: 6
                     Label{text: "地点" draw_text.color: ink draw_text.text_style.font_size: 13}
                     g_place_box := TextInput{width: Fill height: 34 empty_text: "如:深圳湾"
@@ -1323,7 +1640,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
                 g_risk_src := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
             }
             g_opt_card := View{visible: false width: Fill height: Fit flow: Down spacing: 6
-                Label{text: "方案卡(单击选择)" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                g_opt_src := Label{text: "方案卡(来源:规则 · 单击选择)" draw_text.color: secondary draw_text.text_style.font_size: 11}
                 g_opt_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
                     for i o in g_opts {
                         GestureView{width: Fill height: Fit padding: 10 on_tap: |x, y| g_pick(i)

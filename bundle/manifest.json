@@ -1,11 +1,13 @@
 {
   "capabilities": [
     "net",
-    "storage"
+    "storage",
+    "octos.session.open",
+    "octos.turn.start"
   ],
   "id": "trip-guardian",
   "integrity": {
-    "bundle_blake3": "2504b3513aa5d6671597d94570aab283db7e5528a6ae00f0958a69e32a024f8b"
+    "bundle_blake3": "7333ae9f3fe15085d273e452407e56d3176462ae5c64bd52369d26c822ad6a47"
   },
   "name": "行程天气",
   "network": {
