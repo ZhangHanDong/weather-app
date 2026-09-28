@@ -1007,6 +1007,7 @@ fn ledger_seq(){
 fn apply_action(plan, opt){
     if opt.act == "reschedule" {
         plan = redate_plan(plan, opt)
+        plan.rescheduled = true
     }
     elif opt.act == "mark_indoor" { plan.indoor = true }
     elif opt.act == "add_checklist" {
@@ -1047,7 +1048,7 @@ fn g_confirm(){
         return
     }
     if g_stage != 2 { return }
-    let plan = {id: "p" + time_now() place: g_place date: g_date start: g_start dur: g_dur indoor: false checklist: [] done: false}
+    let plan = {id: "p" + time_now() place: g_place date: g_date start: g_start dur: g_dur indoor: false rescheduled: false checklist: [] done: false}
     let before = g_date + " " + g_start
     let after = apply_action(plan, opt)
     g_plans.push(after)
@@ -1073,20 +1074,34 @@ fn g_verify(){
     let lv = day_level_of(p.date, p.start, p.dur)
     let readback = p.place + " " + short_date(p.date) + " " + p.start
     let verdict = ""
+    // #27-2: 「新时段不是高风险」只用于改期(reschedule)。室内/携带/保持
+    // 核验「读回的计划与执行内容一致」;风险仍高时另起一行提醒,不判失败。
     if p.indoor {
         g_verify_line = "核验通过 · 读回 " + readback + " · 室内"
         g_note = "核验通过"
         verdict = "通过(室内)"
     }
-    elif lv == "高" {
-        g_verify_line = "核验未通过 · 读回 " + readback + " · 新时段风险高"
-        g_note = "核验未通过,可重选方案"
-        verdict = "未通过(新时段风险高)"
+    elif has_key(p, "rescheduled") && p.rescheduled {
+        if lv == "高" {
+            g_verify_line = "核验未通过 · 读回 " + readback + " · 新时段风险高"
+            g_note = "核验未通过,可重选方案"
+            verdict = "未通过(新时段风险高)"
+        } else {
+            g_verify_line = "核验通过 · 读回 " + readback + " · 新时段风险" + lv
+            g_note = "核验通过"
+            verdict = "通过(新时段风险" + lv + ")"
+        }
     }
     else {
-        g_verify_line = "核验通过 · 读回 " + readback + " · 新时段风险" + lv
+        let check_txt = ""
+        if p.checklist != nil && p.checklist.len() > 0 { check_txt = " · 携带:" + join_list(p.checklist) }
+        g_verify_line = "核验通过 · 读回 " + readback + check_txt
         g_note = "核验通过"
-        verdict = "通过(新时段风险" + lv + ")"
+        verdict = "通过(读回一致" + check_txt + ")"
+        if lv == "高" {
+            g_verify_line = g_verify_line + "\n风险提醒:计划时段风险仍为高,建议改期或改为室内"
+            verdict = verdict + ";风险仍高"
+        }
     }
     // #25-8:核验也记台账(kind=verify,结果+原因+数据时间)
     let seq = ledger_seq()
@@ -1132,6 +1147,13 @@ fn del_plan(i){
 
 fn g_start_input(text){
     g_input = text
+    if wx == nil {
+        // #27-1: 预报未到(刚启动/断网)→ 不发 agent,不卡「正在…」,明确提示
+        g_src_parse = "规则"
+        g_note = "天气数据还没就绪,稍等再试"
+        render_guard()
+        return
+    }
     if g_agent_state == 2 {
         g_src_parse = "规则"
         g_parse()
@@ -1201,6 +1223,8 @@ fn back_home(){
 
 fn render_guard(){
     ui.g_note_lbl.set_text(g_note)
+    if g_agent_state == 1 { ui.g_title.set_text("行程守护 · agent 版") }
+    else { ui.g_title.set_text("行程守护 · 规则版(无 agent)") }
     ui.g_parse_src.set_text("解析卡(来源:" + g_src_parse + " · 可修改后重新评估)")
     ui.g_opt_src.set_text("方案卡(来源:" + g_src_opts + " · 单击选择)")
     ui.g_parse_card.set_visible(g_stage >= 1)
@@ -1232,11 +1256,34 @@ fn render_guard(){
 // 协议出处:docs/AI-SERVICES.md「A minimal call」+ HOST-SERVICES.md
 // (card-host 无 octos 服务,host.request 立即回 no service answers,不挂起)。
 
+// #27-1: 台账时间不依赖预报(wx 可能为 nil,如刚启动/断网)。用预报时间,没有则应用时间。
+fn now_stamp(){
+    if wx == nil { return fmt_dt(now_local_iso()) }
+    return fmt_dt(wx.time)
+}
+fn now_local_iso(){
+    // 应用自己的时间:local_time 在 card-host 是 UTC,如实标注 Z
+    let t = local_time()
+    let mo = t.month
+    let da = t.day
+    let ho = t.hour
+    let mi = t.minute
+    let ms = "" + mo
+    let ds = "" + da
+    let hs = "" + ho
+    let mis = "" + mi
+    if mo < 10.0 { ms = "0" + mo }
+    if da < 10.0 { ds = "0" + da }
+    if ho < 10.0 { hs = "0" + ho }
+    if mi < 10.0 { mis = "0" + mi }
+    return "" + t.year + "-" + ms + "-" + ds + "T" + hs + ":" + mis
+}
+
 fn agent_ledger(chan, good, reason){
     let seq = ledger_seq()
     let d = "不合规:" + reason
     if good { d = "合规采用" }
-    g_ledger.push({seq: seq at: fmt_dt(wx.time) kind: "agent" action_id: chan detail: d})
+    g_ledger.push({seq: seq at: now_stamp() kind: "agent" action_id: chan detail: d})
     save_ledger()
 }
 
@@ -1594,7 +1641,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             ButtonFlat{text: "返回首页" height: 36 padding: Inset{left: 12 right: 12} on_click: || back_home()
                 draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
                 draw_text +: {color: ink color_hover: ink color_down: ink}}
-            Label{width: Fill text: "行程守护 · 规则版(无 agent)" draw_text.color: secondary draw_text.text_style.font_size: 12}
+            g_title := Label{width: Fill text: "行程守护 · 规则版(无 agent)" draw_text.color: secondary draw_text.text_style.font_size: 12}
         }
         View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             g_in := TextInput{width: Fill height: 40 empty_text: "例如:周六上午 9 点去深圳湾骑车,大概两小时"
