@@ -5,7 +5,7 @@
   ],
   "id": "trip-guardian",
   "integrity": {
-    "bundle_blake3": "0b9d788de6f4a383157ab903db80b46af19847eb1662960ccf5ab65e5760991c"
+    "bundle_blake3": "2af7ad9b31ca59bced602489d989c7d0333ea8775c53de530d56a2a633a5dbbd"
   },
   "name": "行程天气",
   "network": {

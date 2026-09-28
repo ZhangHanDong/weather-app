@@ -291,13 +291,33 @@ fn toggle_panel(){
     if panel_open { close_panel() } else { open_panel() }
 }
 
+fn coord_str(la, lo){
+    return "(" + round(la*100.0)/100.0 + ", " + round(lo*100.0)/100.0 + ")"
+}
+
+// 候选行说明:admin2(区县)优先,缺失时用经纬度补;
+// 同名同区仍分不开的,由 do_search 再补坐标(见下)。
 fn geo_label(r){
-    let parts = []
-    if has_key(r, "admin1") && r.admin1 != nil && r.admin1 != "" { parts.push(r.admin1) }
-    if has_key(r, "country") && r.country != nil && r.country != "" { parts.push(r.country) }
-    if parts.len() == 0 { return "—" }
-    let s = parts[0]
-    if parts.len() >= 2 { s = s + " · " + parts[1] }
+    let s = ""
+    let has2 = has_key(r, "admin2") && r.admin2 != nil && r.admin2 != ""
+    if has2 {
+        s = r.admin2
+        if has_key(r, "admin1") && r.admin1 != nil && r.admin1 != "" && r.admin1 != r.admin2 { s = s + " · " + r.admin1 }
+    } else if has_key(r, "admin1") && r.admin1 != nil && r.admin1 != "" {
+        s = r.admin1
+    }
+    if has_key(r, "country") && r.country != nil && r.country != "" { s = s + " · " + r.country }
+    if !has2 { s = s + " " + coord_str(r.latitude, r.longitude) }
+    return s
+}
+
+fn plain_country(r){
+    let s = ""
+    if has_key(r, "admin1") && r.admin1 != nil && r.admin1 != "" { s = r.admin1 }
+    if has_key(r, "country") && r.country != nil && r.country != "" {
+        if s == "" { s = r.country } else { s = s + " · " + r.country }
+    }
+    if s == "" { s = "—" }
     return s
 }
 
@@ -321,7 +341,16 @@ fn do_search(text){
     if data != nil && has_key(data, "results") {
         for r in data.results {
             if r.name == nil || r.latitude == nil || r.longitude == nil { continue }
-            got.push({name: r.name country: geo_label(r) lat: r.latitude lon: r.longitude})
+            got.push({name: r.name country: geo_label(r) plain: plain_country(r) lat: r.latitude lon: r.longitude})
+        }
+    }
+    // 同名候选若说明仍相同(如两个「重庆市 · 中国」),给后出现的补经纬度
+    for i in got.len() {
+        for j in i {
+            if got[j].country == got[i].country {
+                got[i].country = got[i].country + " " + coord_str(got[i].lat, got[i].lon)
+                break
+            }
         }
     }
     results = got
@@ -339,7 +368,9 @@ fn pick_hit(h){
         if cities[i].name == h.name && abs(cities[i].lat - h.lat) < 0.01 && abs(cities[i].lon - h.lon) < 0.01 { dup = i }
     }
     if dup >= 0 { select_city(dup) return }
-    cities.push({name: h.name country: h.country lat: h.lat lon: h.lon})
+    let pc = h.plain
+    if pc == nil || pc == "" { pc = h.country }
+    cities.push({name: h.name country: pc lat: h.lat lon: h.lon})
     select_city(cities.len() - 1)
 }
 
@@ -347,7 +378,7 @@ fn select_city(i){
     if i >= cities.len() { return }
     cur = i
     save_cities()
-    ui.city_btn.set_text(cities[cur].name + " ▾")
+    ui.city_btn.set_text(cities[cur].name + " 切换")
     close_panel()
     refresh()
 }
@@ -356,7 +387,7 @@ fn select_city(i){
 
 fn boot(){
     load_cities()
-    ui.city_btn.set_text(cities[cur].name + " ▾")
+    ui.city_btn.set_text(cities[cur].name + " 切换")
     refresh()
     if refresh_timer == nil { refresh_timer = start_interval(900.0, || refresh()) }
 }
@@ -369,7 +400,7 @@ let hairline = #xe5e5ea
 SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.color: #xffffff
     View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
         Label{text: "行程天气" draw_text.color: ink draw_text.text_style: theme.font_bold{font_size: 22}}
-        city_btn := ButtonFlat{text: "深圳 ▾" height: 36 padding: Inset{left: 14 right: 14} on_click: || toggle_panel()
+        city_btn := ButtonFlat{text: "深圳 切换" height: 36 padding: Inset{left: 14 right: 14} on_click: || toggle_panel()
             draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
             draw_text +: {color: ink color_hover: ink color_down: ink}}
         note_lbl := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
