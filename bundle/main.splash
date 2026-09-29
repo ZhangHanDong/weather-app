@@ -1482,7 +1482,11 @@ fn render_guard(){
     ui.g_note_lbl.set_text(g_note)
     // #33-4: 标题反映「本次方案/解析」的真实来源——键在来源标志而非 state
     // (点「改用规则」后 state=2,但本次解析若来自 agent,标题仍应如实说明)
-    if g_src_opts == "agent" { ui.g_title.set_text("行程守护 · agent 版") }
+    // #35-3: 初值 g_src_*=="规则" ≠ 已有结果——刚开页/尚未出结果时不得写「无 agent」;
+    // 请求在途(pending)写「正在请助手…」;有结果(g_stage≥1)后才按来源标注。
+    if g_agent_pending || g_opt_pending { ui.g_title.set_text("行程守护 · 正在请助手…") }
+    elif g_stage == 0 { ui.g_title.set_text("行程守护") }
+    elif g_src_opts == "agent" { ui.g_title.set_text("行程守护 · agent 版") }
     elif g_src_parse == "agent" { ui.g_title.set_text("行程守护 · 解析来自 agent · 方案由规则给出") }
     else { ui.g_title.set_text("行程守护 · 规则版(无 agent)") }
     ui.g_rules_btn.set_visible(g_agent_reject)
@@ -1875,6 +1879,7 @@ fn agent_ask(chan, prompt){
     g_agent_chan = chan
     g_agent_reject = false
     g_agent_pending = true
+    render_guard()   // #35-3: pending 置位即刷标题「正在请助手…」(g_start_input 先渲染后进入,否则解析在途不显)
     g_agent_timer = start_timeout(30.0, || agent_timeout())
     host.request("octos.session.open", {}, fn(sess){
         if !sess.is_ok {
