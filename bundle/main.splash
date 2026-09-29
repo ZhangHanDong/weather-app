@@ -582,7 +582,9 @@ fn g_parse(){
     if du > 0 { dur = du }
     // 日期默认今天(如实告知,不算缺项)
     let date_is_today = pdate == today
-    g_place = parse_place(text)
+    let mp = split_multi_place(parse_place(text))
+    g_place = mp.first
+    let place_extra = mp.extra
     g_date = pdate
     g_start = ""
     if t_found { g_start = fmt_hm(hh + 0.0, mm + 0.0) }
@@ -605,6 +607,7 @@ fn g_parse(){
     if missing.len() == 0 && date_is_today && text.search("今天") < 0 && text.search("明天") < 0 && text.search("后天") < 0 {
         g_note = "已解析(日期按今天)· 按「评估风险」继续"
     }
+    if place_extra != "" { g_note = g_note + " · 还提到:" + place_extra + "(可在解析卡修改)" }
     render_guard()
 }
 
@@ -730,6 +733,26 @@ fn parse_dur(text){
 }
 
 // 地点:「去<place>」到 骑车/爬山/跑步/露营/野餐/散步/拍照/看日出/看日落 或句尾
+// #34-3: 一句话两个地点(「深圳湾和蛇口」)→ 取第一个,另一个写进提示。
+fn split_multi_place(p){
+    for sep in ["和","跟","与"] {
+        let i = p.search(sep)
+        if i > 2 {   // 「A和B」:A 至少 2 字
+            let parts = p.split(sep)
+            if parts.len() >= 2 {
+                let first = parts[0].trim()
+                let rest = parts[1].trim()
+                for st in ["看日出","看日落","看海","逛街","游泳","骑车","骑行","爬山","跑步","徒步","露营","野餐","散步","拍照","玩水","钓鱼","放风筝"] {
+                    let suf = rest.strip_suffix(st)
+                    if suf != nil && suf != rest { rest = suf break }
+                }
+                if first != "" && rest != "" { return {first: first extra: rest} }
+            }
+        }
+    }
+    return {first: p extra: ""}
+}
+
 fn parse_place(text){
     let i = text.search("去")
     if i < 0 { return "" }
@@ -1728,13 +1751,39 @@ fn agent_parse_ok(text){
     let n = 0
     for k v in o { n = n + 1 }
     if n != 5 { return {is_good: false why: "有多余字段"} }
+    // #34-1: 字段先归一化为字符串再检查(脚本无 typeof;探针语义:
+    // ""+nil→""、""+数字→数字串、""+对象→"[ScriptObject]"、""+数组→"[Unknown]"。
+    // 类型错误(对象/数组)会得到哨兵串,正则不匹配 → 不合规,绝不让
+    // regex.test 直接吃到非字符串(operator 卡死根因)。
+    let place_s = "" + o.place
+    let date_s = "" + o.date
+    let start_s = "" + o.start
+    let dur_s = "" + o.duration_min
+    // #34-③: 嵌套对象/数组字段 → 哨兵串含「[」→ 判不合规(不得蒙混过关)
+    for sv in [place_s, date_s, start_s, dur_s] {
+        if sv.search("[") >= 0 { return {is_good: false why: "字段类型错误(对象/数组):" + sv} }
+    }
+    if "" + o.missing != "[Unknown]" { return {is_good: false why: "missing 非数组"} }
+    let miss = []
+    for m in o.missing { miss.push("" + m) }
+    // 缺项字段允许空或 nil(#34-1):missing 里声明了就按缺项放行
     let dr = regex("[0-9]{4}-[0-9]{2}-[0-9]{2}", "")
-    if !dr.test(o.date) { return {is_good: false why: "date 非 YYYY-MM-DD"} }
     let tr = regex("[0-9]{2}:[0-9]{2}", "")
-    if !tr.test(o.start) { return {is_good: false why: "start 非 HH:MM"} }
-    let du = o.duration_min
-    if !(du >= 15.0 && du <= 720.0) { return {is_good: false why: "duration_min 越界或非数字"} }
-    return {is_good: true o: o}
+    let nr = regex("[0-9]+[.]?[0-9]*", "")
+    if date_s == "" || start_s == "" || dur_s == "" {
+        // 空字段必须有对应 missing 声明,否则不合规
+        if date_s == "" && !in_list(miss, "date") { return {is_good: false why: "date 为空且未声明缺项"} }
+        if start_s == "" && !in_list(miss, "start") { return {is_good: false why: "start 为空且未声明缺项"} }
+        if dur_s == "" && !in_list(miss, "duration_min") { return {is_good: false why: "duration_min 为空且未声明缺项"} }
+    } else {
+        if !dr.test(date_s) { return {is_good: false why: "date 非 YYYY-MM-DD"} }
+        if !tr.test(start_s) { return {is_good: false why: "start 非 HH:MM"} }
+        if !nr.test(dur_s) { return {is_good: false why: "duration_min 非数字"} }
+        let du = dur_s.to_f64()
+        if !(du >= 15.0 && du <= 720.0) { return {is_good: false why: "duration_min 越界"} }
+    }
+    // 空地点放行为缺项(解析卡留空提示补全),不判不合规
+    return {is_good: true o: {place: place_s date: date_s start: start_s duration_min: dur_s missing: miss}}
 }
 
 // 方案回复校验:{options:[{action,why,checklist}]},1-3 项,四条规则全查
@@ -1746,6 +1795,8 @@ fn agent_options_ok(text, facts){
     let n = 0
     for k v in o { n = n + 1 }
     if n != 1 { return {is_good: false why: "有多余字段"} }
+    // #34-2: 数组与类型守卫(哨兵串判定),任何畸形回复都不允许走到运行时错误
+    if "" + o.options != "[Unknown]" { return {is_good: false why: "options 非数组"} }
     let opts = o.options
     if opts.len() < 1 || opts.len() > 3 { return {is_good: false why: "options 数量 1-3"} }
     let acts = ["reschedule","mark_indoor","add_checklist","keep"]
@@ -1754,12 +1805,15 @@ fn agent_options_ok(text, facts){
         let m = 0
         for k v in op { m = m + 1 }
         if m != 3 { return {is_good: false why: "option 有多余/缺失字段"} }
-        if !in_list(acts, op.action) { return {is_good: false why: "action 非法:" + op.action} }
+        if !in_list(acts, "" + op.action) { return {is_good: false why: "action 非法:" + ("" + op.action)} }
+        if "" + op.checklist != "[Unknown]" { return {is_good: false why: "checklist 非数组"} }
         for c in op.checklist {
-            if !in_list(vocab, c) { return {is_good: false why: "checklist 越词表:" + c} }
+            if !in_list(vocab, "" + c) { return {is_good: false why: "checklist 越词表:" + ("" + c)} }
         }
-        // #33-1: 先剥时间/日期 token,剩余数字才对照因子值
-        for v in strip_time_tokens(op.why) {
+        // #34-③ + #33-1: why 为对象/数组 → 不合规;否则剥时间/日期 token 后对照因子值
+        let why_s = "" + op.why
+        if why_s.search("[") >= 0 { return {is_good: false why: "why 类型错误(对象/数组)"} }
+        for v in strip_time_tokens(why_s) {
             if !num_ok(v, facts) { return {is_good: false why: "why 含事实外数字 " + v} }
         }
     }
@@ -1876,20 +1930,30 @@ fn agent_reply(chan, text){
         g_agent_bad = 0
         agent_ledger(chan, true, "")
         let o = v.o
-        g_place = o.place
+        // #34-3: agent 通路同样处理多地点(取第一个,其余写提示)
+        let mp = split_multi_place(o.place)
+        g_place = mp.first
+        let place_extra = mp.extra
         g_date = o.date
-        g_start = o.start
-        g_dur = round(o.duration_min)
+        g_start = o.start        // 缺项时为 "",解析卡留空提示补全
+        // #34: duration 缺项时用默认 120,round("") 未定义
+        let dmins = 120.0
+        if o.duration_min != "" { dmins = o.duration_min.to_f64() }
+        g_dur = round(dmins)
         g_stage = 1
         g_no_forecast = ""
         g_verify_line = ""
         g_src_parse = "agent"
-        let miss = o.missing
+        // #34: 缺项提示用中文字段名(与规则通路一致)
+        let zh = {place: "地点" date: "日期" start: "时间" duration_min: "时长"}
+        let miss = []
+        for m in o.missing { miss.push(zh[m]) }
         if miss.len() > 0 {
             g_note = "agent 解析缺:" + join_list(miss) + " · 请在解析卡补全后再评估"
         } else {
             g_note = "agent 已解析 · 按「评估风险」继续"
         }
+        if place_extra != "" { g_note = g_note + " · 还提到:" + place_extra + "(可在解析卡修改)" }
         render_guard()
     } else {
         let facts = fact_nums()
