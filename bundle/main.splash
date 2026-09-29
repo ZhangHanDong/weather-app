@@ -471,7 +471,12 @@ fn today_str(){
 }
 
 fn days_of(ds){
-    let p = ds.split("-")
+    // #35-5: 空日期/nil 一律归一化为 "" 返回 0.0——空串 split 后 len=1,
+    // 取 p[1]/p[2] 会越界 panic(operator 真 agent 下实测崩溃点)
+    let s = "" + ds
+    if s == "" { return 0.0 }
+    let p = s.split("-")
+    if p.len() < 3 { return 0.0 }
     let y = p[0].to_f64()
     let m = p[1].to_f64()
     let d = p[2].to_f64()
@@ -592,20 +597,15 @@ fn g_parse(){
     g_stage = 1
     g_no_forecast = ""
     g_verify_line = ""
-    // 缺项提示(#24/#25-3):缺项框留空;日期默认今天要写明。
-    let missing = []
-    if g_place == "" { missing.push("地点") }
-    if !t_found { missing.push("时间") }
+    // 缺项提示(#24/#25-3 → #35-7):以最终字段为准,白话提示;日期默认今天要写明。
+    let missing = missing_of()
     if missing.len() > 0 {
-        g_note = "已解析,但缺:" + join_list(missing) + " · 请在解析卡补全后再评估"
+        g_note = "还缺:" + join_list(missing) + ",请在解析卡补上后点评估风险"
+        if date_is_today { g_note = "日期按今天 · " + g_note }
+    } elif date_is_today && text.search("今天") < 0 && text.search("明天") < 0 && text.search("后天") < 0 {
+        g_note = "已解析(日期按今天)· 按「评估风险」继续"
     } else {
         g_note = "已解析(本地规则)· 按「评估风险」继续"
-    }
-    if missing.len() > 0 && date_is_today {
-        g_note = "已解析,但缺:" + join_list(missing) + " · 日期按今天;请在解析卡补全后再评估"
-    }
-    if missing.len() == 0 && date_is_today && text.search("今天") < 0 && text.search("明天") < 0 && text.search("后天") < 0 {
-        g_note = "已解析(日期按今天)· 按「评估风险」继续"
     }
     if place_extra != "" { g_note = g_note + " · 还提到:" + place_extra + "(可在解析卡修改)" }
     render_guard()
@@ -614,6 +614,8 @@ fn g_parse(){
 fn year_of(ds){ return ds.split("-")[0].to_f64() }
 
 fn shift_date(ds, n){
+    // #35-5: 空日期不进日期运算(next_date(0.0) 会算出 1970 年的假日期)
+    if ("" + ds) == "" { return "" }
     let out = ds
     for i in n { out = next_date(out) }
     return out
@@ -884,14 +886,25 @@ fn guard_wx(){
     return wx
 }
 
+// #35-4/7: 缺项以最终字段为准(空=缺)——agent 忘了写 missing、或字段空,
+// 一律按缺项处理;缺日期不再进任何日期运算(#35-5)。所有通路统一用它。
+fn missing_of(){
+    let m = []
+    if g_place == "" { m.push("地点") }
+    if g_date == "" { m.push("日期") }
+    if g_start == "" { m.push("时间") }
+    return m
+}
+
 // ---------- 守护页:事实与风险 ----------
 // 阈值出处:Rust 版 src/guardian_g2.rs:178-188 THRESHOLDS
 //   降水概率 ≥60 高 / 30-59 中;小时降水量 ≥2 高 / 0.5-1.9 中;
 //   体感 ≥35 或 ≤0 高 / 32-34.9 中;风速(户外) ≥38 高 / 28-37 中;UV ≥8 中。
 fn g_assess(){
     if wx == nil { g_note = "天气数据还没就绪,稍等再试" render_guard() return }
-    if g_place == "" || g_start == "" {
-        g_note = "解析卡还有缺项(地点/时间),补全后再评估"
+    let gm = missing_of()
+    if gm.len() > 0 {
+        g_note = "还缺:" + join_list(gm) + ",请在解析卡补上后点评估风险"
         render_guard()
         return
     }
@@ -951,6 +964,8 @@ fn g_assess(){
         g_src_opts = "规则"
         build_options(level, hits, pp_w, pr_w, ap_w, uv_w)
         g_note = "风险:" + level + " · " + g_geo_note + " · " + agent_unavailable_note()
+        gos(3)   // #35-6: 方案一到直达③——方案卡和「确认执行」都在这一步
+        g_note = g_note + " · 方案已就绪(第③步)"
         render_guard()
         return
     }
@@ -1404,7 +1419,8 @@ fn g_start_input(text){
     g_note = "正在请 agent 解析…"
     render_guard()
     let today = today_str()
-    let prompt = "今天是 " + today + "(YYYY-MM-DD)。请只回 JSON,字段固定为 {place,date,start,duration_min,missing[]}:place 是地点标签(2-6 字,不含活动词),date 是 YYYY-MM-DD,start 是 HH:MM(24 小时制),duration_min 是分钟数(15-720),missing 是缺失项数组(地点/时间)。用户原话:" + text
+    // #35-4: prompt 写明填空约定——模型不总记得把空字段列进 missing
+    let prompt = "今天是 " + today + "(YYYY-MM-DD)。请只回 JSON,字段固定为 {place,date,start,duration_min,missing[]}:place 是地点标签(2-6 字,不含活动词),date 是 YYYY-MM-DD,start 是 HH:MM(24 小时制),duration_min 是分钟数(15-720),missing 是缺失项数组(地点/时间);不知道的字段填 \"\" 并列入 missing。用户原话:" + text
     agent_ask("parse", prompt)
 }
 
@@ -1413,8 +1429,10 @@ fn g_reassess(){
     let d = ui.g_date_box.text().trim()
     let t = ui.g_time_box.text().trim()
     let du = ui.g_dur_box.text().trim()
-    g_place = ui.g_place_box.text().trim()
-    // 「10/3 周六」→ 当年 M/D
+    // #35-7a: 「缺:X」是提示文案不是输入,不得当成值收(空输入保留原值)
+    let pb = ui.g_place_box.text().trim()
+    if pb != "" && pb.search("缺:") != 0 { g_place = pb }
+    // 「10/3 周六」→ 当年 M/D(「缺:日期」不匹配,保留原值)
     let m = regex("([0-9]{1,2})/([0-9]{1,2})", "").exec(d)
     if m != nil && m.captures.len() >= 3 {
         g_date = fmt_ds(year_of(today_str()), m.captures[1].to_f64(), m.captures[2].to_f64())
@@ -1429,6 +1447,13 @@ fn g_reassess(){
     if nv >= 15.0 && nv <= 720.0 { g_dur = round(nv) }
     g_stage = 1
     g_verify_line = ""
+    // #35-7c: 缺项未补齐 → 不评估,白话提示缺什么
+    let miss = missing_of()
+    if miss.len() > 0 {
+        g_note = "还缺:" + join_list(miss) + ",请在解析卡补上后点评估风险"
+        render_guard()
+        return
+    }
     g_assess()
 }
 
@@ -1505,11 +1530,16 @@ fn render_guard(){
     ui.g_s3.set_visible(g_step == 3)
     ui.g_s4.set_visible(g_step == 4)
     if g_stage >= 1 {
-        ui.g_place_box.set_text(g_place)
-        ui.g_date_box.set_text(short_date(g_date))
-        ui.g_time_box.set_text(g_start)
+        // #35-7a: 空字段直接在框里写「缺:X」(set_text 是唯一文档化改文 API)
+        if g_place == "" { ui.g_place_box.set_text("缺:地点") } else { ui.g_place_box.set_text(g_place) }
+        if g_date == "" { ui.g_date_box.set_text("缺:日期") } else { ui.g_date_box.set_text(short_date(g_date)) }
+        if g_start == "" { ui.g_time_box.set_text("缺:时间") } else { ui.g_time_box.set_text(g_start) }
         ui.g_dur_box.set_text("" + g_dur)
     }
+    // #35-7a: 缺项红字提示(颜色静态声明,运行期只切可见/文案)——只在有解析结果后出现
+    let gm2 = missing_of()
+    ui.g_miss_lbl.set_visible(gm2.len() > 0 && g_stage >= 1)
+    if gm2.len() > 0 && g_stage >= 1 { ui.g_miss_lbl.set_text("缺:" + join_list(gm2) + " · 补上后点「评估风险」") }
     if g_stage >= 2 && g_no_forecast == "" {
         ui.g_risk_line.set_text("风险:" + g_risk_level + " · " + g_risk_line)
         ui.g_risk_src.set_text(g_risk_src)
@@ -1600,6 +1630,8 @@ fn agent_timeout(){
         build_options(g_risk_level, [], nil, nil, nil, nil)
         g_src_opts = "规则"
         g_note = "风险:" + g_risk_level + " · " + agent_timeout_note()
+        gos(3)   // #35-6: 方案一到直达③
+        g_note = g_note + " · 方案已就绪(第③步)"
         render_guard()
     }
 }
@@ -1787,18 +1819,19 @@ fn agent_parse_ok(text){
     if "" + o.missing != "[Unknown]" { return {is_good: false why: "missing 非数组"} }
     let miss = []
     for m in o.missing { miss.push("" + m) }
-    // 缺项字段允许空或 nil(#34-1):missing 里声明了就按缺项放行
+    // #35-4: 空/nil 字段一律按缺项放行并自动补进 missing(模型并不总守
+    // 「写进 missing」的约定);只有类型错误(上面哨兵串)和格式错误才拒。
     let dr = regex("[0-9]{4}-[0-9]{2}-[0-9]{2}", "")
     let tr = regex("[0-9]{2}:[0-9]{2}", "")
     let nr = regex("[0-9]+[.]?[0-9]*", "")
-    if date_s == "" || start_s == "" || dur_s == "" {
-        // 空字段必须有对应 missing 声明,否则不合规
-        if date_s == "" && !in_list(miss, "date") { return {is_good: false why: "date 为空且未声明缺项"} }
-        if start_s == "" && !in_list(miss, "start") { return {is_good: false why: "start 为空且未声明缺项"} }
-        if dur_s == "" && !in_list(miss, "duration_min") { return {is_good: false why: "duration_min 为空且未声明缺项"} }
-    } else {
-        if !dr.test(date_s) { return {is_good: false why: "date 非 YYYY-MM-DD"} }
-        if !tr.test(start_s) { return {is_good: false why: "start 非 HH:MM"} }
+    if place_s == "" && !in_list(miss, "place") { miss.push("place") }
+    if date_s == "" && !in_list(miss, "date") { miss.push("date") }
+    if start_s == "" && !in_list(miss, "start") { miss.push("start") }
+    if dur_s == "" && !in_list(miss, "duration_min") { miss.push("duration_min") }
+    // 非空字段才做格式校验;空 = 缺项,交解析卡补全(#34-1 的放宽延续)
+    if date_s != "" && !dr.test(date_s) { return {is_good: false why: "date 非 YYYY-MM-DD"} }
+    if start_s != "" && !tr.test(start_s) { return {is_good: false why: "start 非 HH:MM"} }
+    if dur_s != "" {
         if !nr.test(dur_s) { return {is_good: false why: "duration_min 非数字"} }
         let du = dur_s.to_f64()
         if !(du >= 15.0 && du <= 720.0) { return {is_good: false why: "duration_min 越界"} }
@@ -1936,6 +1969,8 @@ fn agent_fallback(chan, pfx){
         g_src_opts = "规则"
         build_options(g_risk_level, [], nil, nil, nil, nil)
         g_note = "风险:" + g_risk_level + " · " + pfx
+        gos(3)   // #35-6: 方案一到直达③
+        g_note = g_note + " · 方案已就绪(第③步)"
         render_guard()
     }
 }
@@ -1946,7 +1981,8 @@ fn agent_reply(chan, text){
         if !v.is_good {
             g_agent_bad = g_agent_bad + 1
             agent_ledger(chan, false, v.why)
-            agent_fallback(chan, "助手回复没通过检查(" + v.why + "),已按规则处理")
+            // #35-7c: 不写「agent 不可用」——是这次回复没过检查
+            agent_fallback(chan, "这次助手的回复没通过检查(" + v.why + "),已按规则处理")
             return
         }
         g_agent_bad = 0
@@ -1966,12 +2002,10 @@ fn agent_reply(chan, text){
         g_no_forecast = ""
         g_verify_line = ""
         g_src_parse = "agent"
-        // #34: 缺项提示用中文字段名(与规则通路一致)
-        let zh = {place: "地点" date: "日期" start: "时间" duration_min: "时长"}
-        let miss = []
-        for m in o.missing { miss.push(zh[m]) }
+        // #35-4/7: 缺项以最终字段为准(空=缺),白话提示;框内「缺:X」由 render_guard 写
+        let miss = missing_of()
         if miss.len() > 0 {
-            g_note = "agent 解析缺:" + join_list(miss) + " · 请在解析卡补全后再评估"
+            g_note = "还缺:" + join_list(miss) + ",请在解析卡补上后点评估风险"
         } else {
             g_note = "agent 已解析 · 按「评估风险」继续"
         }
@@ -1984,9 +2018,7 @@ fn agent_reply(chan, text){
             g_agent_bad = g_agent_bad + 1
             agent_ledger(chan, false, v.why)
             if g_agent_bad >= 2 {
-                agent_fallback(chan, agent_fallback_note())
-                g_note = "助手连续两次没有通过检查(" + v.why + "),已改用规则方案"
-                render_guard()
+                agent_fallback(chan, "助手连续两次没通过检查(" + v.why + "),已改用规则方案")
                 return
             }
             g_note = agent_bad_note(v.why)
@@ -2003,7 +2035,8 @@ fn agent_reply(chan, text){
         g_sel = 0
         g_src_opts = "agent"
         g_stage = 2
-        g_note = "风险:" + g_risk_level + " · 方案来自 agent(单击选择)"
+        gos(3)   // #35-6: 方案一到直达③——方案卡和「确认执行」都在这一步
+        g_note = "风险:" + g_risk_level + " · 方案已就绪(第③步,来自 agent)· 单击选择后「确认执行」"
         render_guard()
     }
 }
@@ -2148,6 +2181,10 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
         g_s1 := View{visible: true width: Fill height: Fill flow: Down spacing: 4
             g_parse_card := View{width: Fill height: Fit flow: Down spacing: 4
                 g_parse_src := Label{text: "解析卡(来源:规则 · 可修改后重新评估)" draw_text.color: secondary draw_text.text_style.font_size: 11}
+                // #35-7a: 缺项红字提示——不声明 visible:false(#28 g_execfail_lbl 先例:
+                // 声明即隐藏的 Label 在 timer 回调里 set_visible(true) 不重入布局,
+                // 8142 钩子实证;空文本高度自塌,boot/open 即被 render_guard 藏起)
+                g_miss_lbl := Label{width: Fill height: Fit text: "" draw_text.color: #xff3b30 draw_text.text_style.font_size: 11}
                 View{width: Fill height: Fit flow: Right spacing: 6
                     Label{text: "地点" draw_text.color: ink draw_text.text_style.font_size: 13}
                     g_place_box := TextInput{width: Fill height: 27 empty_text: "如:深圳湾"
