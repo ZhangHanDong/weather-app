@@ -1562,23 +1562,40 @@ fn agent_unavailable_note(){
     return "agent 不可用,方案由规则给出"
 }
 
-// 30 秒超时:回调未至 → 视为不可用,回退规则(#26-6)
+// #35-2: 超时/限流是「这一次没答上」,不是不可用
+fn agent_timeout_note(){
+    return "这次助手没及时回复,已按规则处理"
+}
+
+// #35-2: 只有「服务不存在」才判整个会话不可用
+fn agent_no_service(err){
+    return ("" + err).search("no service") >= 0
+}
+
+// 回退提示按状态选:服务不存在 → 不可用;其余 → 本次没及时回复
+fn agent_fallback_note(){
+    if g_agent_state == 2 { return agent_unavailable_note() }
+    return agent_timeout_note()
+}
+
+// 30 秒超时:回调未至 → 只回退这一次,不关整个会话的 agent(#26-6 → #35-2)
 fn agent_timeout(){
     if !g_agent_pending { return }
     g_agent_pending = false
     if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
-    g_agent_state = 2
     agent_ledger(g_agent_chan, false, "30 秒无响应")
     if g_agent_chan == "parse" {
+        g_src_parse = "规则"
         g_parse()
-        g_note = agent_unavailable_note()
+        // #35-1: 前缀拼接,保留规则解析的 note(缺项、还提到:…)
+        g_note = agent_timeout_note() + " · " + g_note
         render_guard()
     } else {
         g_opt_pending = false
         g_opts = []
         build_options(g_risk_level, [], nil, nil, nil, nil)
         g_src_opts = "规则"
-        g_note = "风险:" + g_risk_level + " · " + agent_unavailable_note()
+        g_note = "风险:" + g_risk_level + " · " + agent_timeout_note()
         render_guard()
     }
 }
@@ -1852,7 +1869,7 @@ fn agent_opts_to_g(opts){
 // 统一入口:先 session.open,再 turn.start;回包走校验
 fn agent_ask(chan, prompt){
     if g_agent_state == 2 {
-        agent_fallback(chan)
+        agent_fallback(chan, agent_unavailable_note())
         return
     }
     g_agent_chan = chan
@@ -1861,20 +1878,20 @@ fn agent_ask(chan, prompt){
     g_agent_timer = start_timeout(30.0, || agent_timeout())
     host.request("octos.session.open", {}, fn(sess){
         if !sess.is_ok {
-            g_agent_state = 2
+            if agent_no_service(sess.error) { g_agent_state = 2 }
             g_agent_pending = false
             if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
             agent_ledger(chan, false, "session.open:" + sess.error)
-            agent_fallback(chan)
+            agent_fallback(chan, agent_fallback_note())
             return
         }
         host.request("octos.turn.start", {text: prompt}, fn(r){
             g_agent_pending = false
             if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
             if !r.is_ok {
-                g_agent_state = 2
+                if agent_no_service(r.error) { g_agent_state = 2 }
                 agent_ledger(chan, false, "turn.start:" + r.error)
-                agent_fallback(chan)
+                agent_fallback(chan, agent_fallback_note())
                 return
             }
             g_agent_state = 1
@@ -1903,17 +1920,17 @@ fn agent_bad_note(technical){
     return "助手回复没有通过检查(" + technical + ")。可以点「改用规则」继续,不影响使用"
 }
 
-fn agent_fallback(chan){
+fn agent_fallback(chan, pfx){
     g_opt_pending = false
     if chan == "parse" {
         g_src_parse = "规则"
         g_parse()
-        g_note = agent_unavailable_note() + " · " + g_note
+        g_note = pfx + " · " + g_note
         render_guard()
     } else {
         g_src_opts = "规则"
         build_options(g_risk_level, [], nil, nil, nil, nil)
-        g_note = "风险:" + g_risk_level + " · " + agent_unavailable_note()
+        g_note = "风险:" + g_risk_level + " · " + pfx
         render_guard()
     }
 }
@@ -1924,7 +1941,7 @@ fn agent_reply(chan, text){
         if !v.is_good {
             g_agent_bad = g_agent_bad + 1
             agent_ledger(chan, false, v.why)
-            agent_fallback(chan)
+            agent_fallback(chan, "助手回复没通过检查(" + v.why + "),已按规则处理")
             return
         }
         g_agent_bad = 0
@@ -1962,7 +1979,7 @@ fn agent_reply(chan, text){
             g_agent_bad = g_agent_bad + 1
             agent_ledger(chan, false, v.why)
             if g_agent_bad >= 2 {
-                agent_fallback(chan)
+                agent_fallback(chan, agent_fallback_note())
                 g_note = "助手连续两次没有通过检查(" + v.why + "),已改用规则方案"
                 render_guard()
                 return
