@@ -57,6 +57,7 @@ let g_opt_pending = false          // #33-2: 方案请求进行中(禁用评估�
 let g_agent_timer = nil
 let g_agent_chan = ""            // parse | options
 let g_allow_asked = false       // #36-4: 同意弹窗已提示过一次(再来 = 用户没允许)
+let g_wait_allow = false        // #37-4: 同意未决中——规则结果已给出,标题写「等你允许助手」
 let g_src_parse = "规则"
 let g_agent_reject = false       // #28-5: 拒绝后展示「改用规则」
 let g_exec_fail = ""             // #28-4: 执行失败原因(空=成功)
@@ -678,7 +679,8 @@ fn match_day_after(text){
 }
 
 fn match_slash(text){
-    let m = regex("([0-9]{1,2})/([0-9]{1,2})", "").exec(text)
+    // #37-4: 前导零豁免——「10/05」「09/30」等带 0 写法直接命中
+    let m = regex("(0?[1-9]|[12][0-9]|3[01])/(0?[1-9]|[12][0-9]|3[01])", "").exec(text)
     if m != nil && m.captures.len() >= 3 {
         let mo = m.captures[1].to_f64()
         let d = m.captures[2].to_f64()
@@ -1534,6 +1536,8 @@ fn render_guard(){
     elif g_stage == 0 { ui.g_title.set_text("行程守护") }
     elif g_src_opts == "agent" { ui.g_title.set_text("行程守护 · agent 版") }
     elif g_src_parse == "agent" { ui.g_title.set_text("行程守护 · 解析来自 agent · 方案由规则给出") }
+    // #37-4: 同意未决、规则结果已给出 → 如实写「等你允许助手」,不写「无 agent」
+    elif g_wait_allow { ui.g_title.set_text("行程守护 · 等你允许助手") }
     else { ui.g_title.set_text("行程守护 · 规则版(无 agent)") }
     ui.g_rules_btn.set_visible(g_agent_reject)
     // #33-2: 文档化 API 只有 set_visible/set_text——pending 时藏评估按钮,行内提示进度
@@ -1666,6 +1670,8 @@ fn err80(err){
 fn agent_host_err(chan, stage, err){
     g_agent_pending = false
     if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
+    // #37-4: 同意未决 → 置位(标题「等你允许助手」);agent 成功回复/新请求时复位
+    if agent_wait_allow(err) { g_wait_allow = true }
     agent_ledger(chan, false, stage + ":" + err80(err))
     if agent_no_service(err) {
         g_agent_state = 2
@@ -1697,7 +1703,7 @@ fn agent_timeout(){
     if interrupted {
         agent_ledger(g_agent_chan, false, "回复处理被中断(时间预算),看门狗按规则恢复")
     } else {
-        agent_ledger(g_agent_chan, false, "30 秒无响应")
+        agent_ledger(g_agent_chan, false, "90 秒无响应")
     }
     if g_agent_chan == "parse" {
         g_src_parse = "规则"
@@ -2050,9 +2056,25 @@ fn agent_ask(chan, prompt){
     }
     g_agent_chan = chan
     g_agent_reject = false
+    g_wait_allow = false   // #37-4: 新请求重置等待允许状态
     g_agent_pending = true
     render_guard()   // #35-3: pending 置位即刷标题「正在请助手…」(g_start_input 先渲染后进入,否则解析在途不显)
-    g_agent_timer = start_timeout(30.0, || agent_timeout())
+    g_agent_timer = start_timeout(90.0, || agent_timeout())
+    // #37-3: 等待期先按规则给出——内核限流时 30 秒×3 重试约需 90 秒,
+    // 期间界面不空等:规则结果先上屏,agent 结果到了替换并标注来源
+    if chan == "parse" {
+        g_src_parse = "规则"
+        g_parse()
+        g_note = "助手繁忙,正在重试…(已先按规则给出) · " + g_note
+        render_guard()
+    } else {
+        g_src_opts = "规则"
+        build_options(g_risk_level, [], nil, nil, nil, nil)
+        g_stage = 2
+        gos(3)
+        g_note = "风险:" + g_risk_level + " · 助手繁忙,正在重试…(已先按规则给出,agent 方案到了会替换)"
+        render_guard()
+    }
     host.request("octos.session.open", {}, fn(sess){
         if !sess.is_ok {
             agent_host_err(chan, "session.open", sess.error)
@@ -2066,6 +2088,7 @@ fn agent_ask(chan, prompt){
                 return
             }
             g_agent_state = 1
+            g_wait_allow = false
             g_agent_replied = true
             agent_reply(chan, r.data.text)
             agent_done()
