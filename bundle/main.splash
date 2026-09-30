@@ -55,6 +55,7 @@ let g_agent_pending = false
 let g_agent_replied = false        // #37-1: 回调已进、处理函数是否完整走完(区分超时/被掐断)
 let g_opt_pending = false          // #33-2: 方案请求进行中(禁用评估按钮)
 let g_agent_timer = nil
+let g_busy_timer = nil           // #37-3: 繁忙提示延迟器(8 秒仍在等才显示;立即错误在它之前就回退,不叠加前缀)
 let g_agent_chan = ""            // parse | options
 let g_allow_asked = false       // #36-4: 同意弹窗已提示过一次(再来 = 用户没允许)
 let g_wait_allow = false        // #37-4: 同意未决中——规则结果已给出,标题写「等你允许助手」
@@ -1674,6 +1675,7 @@ fn err80(err){
 fn agent_host_err(chan, stage, err){
     g_agent_pending = false
     if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
+    if g_busy_timer != nil { stop_timer(g_busy_timer) g_busy_timer = nil }
     // #37-4: 同意未决 → 置位(标题「等你允许助手」);agent 成功回复/新请求时复位
     if agent_wait_allow(err) { g_wait_allow = true }
     agent_ledger(chan, false, stage + ":" + err80(err))
@@ -1692,7 +1694,30 @@ fn agent_done(){
     g_opt_pending = false
     g_agent_replied = false
     if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
+    if g_busy_timer != nil { stop_timer(g_busy_timer) g_busy_timer = nil }
     render_guard()
+}
+
+// #37-3: 繁忙先按规则给出——8 秒仍在等才触发。宿主立即错误(不可用/同意
+// 未决)在这之前就回退了,不会出现「繁忙重试」+「不可用」双前缀;真繁忙
+// (内核 30s×3 限流重试)时界面先给规则结果,agent 到了由 agent_reply 替换。
+fn agent_busy_show(){
+    if !g_agent_pending || g_agent_replied { return }
+    if g_agent_chan == "parse" {
+        if g_stage >= 2 { return }   // 已往下走(评估/执行),不翻回解析卡
+        g_src_parse = "规则"
+        g_parse()
+        g_note = "助手繁忙,正在重试…(已先按规则给出) · " + g_note
+        render_guard()
+    } else {
+        if g_last_action_id != "" && g_stage == 3 { return }
+        g_src_opts = "规则"
+        build_options(g_risk_level, [], nil, nil, nil, nil)
+        g_stage = 2
+        gos(3)
+        g_note = "风险:" + g_risk_level + " · 助手繁忙,正在重试…(已先按规则给出,agent 方案到了会替换)"
+        render_guard()
+    }
 }
 
 // 30 秒看门狗(#26-6 → #35-2 → #37-1):只回退这一次,不关整个会话的 agent。
@@ -1704,6 +1729,7 @@ fn agent_timeout(){
     g_agent_pending = false
     g_agent_replied = false
     if g_agent_timer != nil { stop_timer(g_agent_timer) g_agent_timer = nil }
+    if g_busy_timer != nil { stop_timer(g_busy_timer) g_busy_timer = nil }
     if interrupted {
         agent_ledger(g_agent_chan, false, "回复处理被中断(时间预算),看门狗按规则恢复")
     } else {
@@ -2069,21 +2095,9 @@ fn agent_ask(chan, prompt){
     g_agent_pending = true
     render_guard()   // #35-3: pending 置位即刷标题「正在请助手…」(g_start_input 先渲染后进入,否则解析在途不显)
     g_agent_timer = start_timeout(90.0, || agent_timeout())
-    // #37-3: 等待期先按规则给出——内核限流时 30 秒×3 重试约需 90 秒,
-    // 期间界面不空等:规则结果先上屏,agent 结果到了替换并标注来源
-    if chan == "parse" {
-        g_src_parse = "规则"
-        g_parse()
-        g_note = "助手繁忙,正在重试…(已先按规则给出) · " + g_note
-        render_guard()
-    } else {
-        g_src_opts = "规则"
-        build_options(g_risk_level, [], nil, nil, nil, nil)
-        g_stage = 2
-        gos(3)
-        g_note = "风险:" + g_risk_level + " · 助手繁忙,正在重试…(已先按规则给出,agent 方案到了会替换)"
-        render_guard()
-    }
+    // #37-3: 8 秒仍在等 → 先按规则给出并提示繁忙(agent_busy_show);
+    // 内核限流 30s×3 重试约 90 秒,期间界面不空等
+    g_busy_timer = start_timeout(8.0, || agent_busy_show())
     host.request("octos.session.open", {}, fn(sess){
         if !sess.is_ok {
             agent_host_err(chan, "session.open", sess.error)
