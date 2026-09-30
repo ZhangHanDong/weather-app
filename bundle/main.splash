@@ -866,6 +866,10 @@ fn guard_url_for(lat, lon, date){
     if t != "" {
         let cap = shift_date(t, 15)
         if days_of(to) - days_of(cap) > 0.0 { to = cap }
+        // 自审修复:超窗(计划日 > 今天+15)时 from 也要夹进窗内——
+        // start_date>end_date 会 4xx,被误报成「取数失败」;夹住后 hall 无该日
+        // 数据,自然走 g_assess 的超窗分支(「超出预报范围」)
+        if days_of(from) - days_of(to) > 0.0 { from = to }
     }
     return "https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon
         + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
@@ -1713,6 +1717,11 @@ fn agent_timeout(){
         render_guard()
     } else {
         g_opt_pending = false
+        // 自审修复(#37-3):已执行规则方案 → 超时不再重建方案/覆盖「已执行」note
+        if g_last_action_id != "" && g_stage == 3 {
+            render_guard()
+            return
+        }
         g_opts = []
         build_options(g_risk_level, [], nil, nil, nil, nil)
         g_src_opts = "规则"
@@ -2165,6 +2174,14 @@ fn agent_reply(chan, text){
     } else {
         // 回复已到,处理中——先解除 pending(硬预算中断时按钮/提示不会永久卡住)
         g_opt_pending = false
+        // 自审修复(#37-3):等待期用户已执行规则方案 → agent 结果不再替换
+        // (执行不可逆);台账记录,note 提示重新解析可再用 agent
+        if g_last_action_id != "" && g_stage == 3 {
+            agent_ledger(chan, true, "用户已执行规则方案,agent 回复保留不替换")
+            g_note = "agent 回复已到;你已执行规则方案,未替换。点「解析」重新开始可用 agent"
+            render_guard()
+            return
+        }
         let facts = fact_nums()
         let v = agent_options_ok(text, facts)
         if !v.is_good {
