@@ -822,13 +822,14 @@ fn guard_fetch_for(place){
     if p == nil {
         g_geo = nil
         // #37-2: 首页 hall 已瘦身为 24h——回退当前城市也要主动取计划窗
-        let ok = guard_fetch_ll(cities[cur].lat, cities[cur].lon, cities[cur].name, "")
-        if ok { g_geo_note = "没找到「" + place + "」,按当前城市〈" + cities[cur].name + "〉的预报" }
+        // (注:变量名不得用 ok——保留字,parse 阶段即报错,octo check 查不出来)
+        let got = guard_fetch_ll(cities[cur].lat, cities[cur].lon, cities[cur].name, "")
+        if got { g_geo_note = "没找到「" + place + "」,按当前城市〈" + cities[cur].name + "〉的预报" }
         return
     }
     g_geo = p
-    let ok2 = guard_fetch_ll(p.lat, p.lon, p.name + " · ", p.label)
-    if ok2 { g_geo_note = "按〈" + p.name + " · " + p.label + "〉的预报" }
+    let got2 = guard_fetch_ll(p.lat, p.lon, p.name + " · ", p.label)
+    if got2 { g_geo_note = "按〈" + p.name + " · " + p.label + "〉的预报" }
 }
 
 // #37-2: 守护窗取数函数——只取计划日(含)+5 天的逐小时,不再解析 16 天。
