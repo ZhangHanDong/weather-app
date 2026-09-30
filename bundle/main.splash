@@ -190,60 +190,32 @@ fn fetch(url){
 }
 
 fn forecast_url(c){
+    // #37-2: 首页只要当前温度/天气 + 24h 逐时温雨 + 10 天日级;
+    // forecast_hours=24 让 hourly 只回 24 条(不再解析 16 天逐小时)
     return "https://api.open-meteo.com/v1/forecast?latitude=" + c.lat + "&longitude=" + c.lon
         + "&current=temperature_2m,weather_code"
-        + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
+        + "&hourly=temperature_2m,precipitation_probability"
         + "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
-        + "&timezone=auto&forecast_days=16"
+        + "&timezone=auto&forecast_days=10&forecast_hours=24"
 }
 
-// "2026-09-28T13:15" → "2026-09-28T13:"(逐小时数组里找当前小时的锚)
-fn hour_prefix(iso){
-    let pt = iso.split("T")
-    if pt.len() < 2 { return "" }
-    let hm = pt[1].split(":")
-    if hm.len() < 1 { return "" }
-    return pt[0] + "T" + hm[0] + ":"
-}
-
+// #37-2: 首页解析瘦身——URL 已带 forecast_hours=24,逐小时直接映射前 24 条,
+// 不再建 16 天 hall、不再做当前小时锚的线性搜索(hour_prefix 删除)。
 fn parse_forecast(body){
     let data = body.parse_json()
     if data == nil { return nil }
     if !has_key(data, "current") { return nil }
     let ctm = data.current.time
     if ctm == nil { return nil }
-    let hall = []
+    let hours = []
     if has_key(data, "hourly") && has_key(data.hourly, "time") {
         let ht = data.hourly.time
         for j in ht.len() {
+            if j >= 24 { break }
             let pt = ht[j].split("T")
             let hh = ""
             if pt.len() >= 2 { hh = pt[1].split(":")[0] }
-            let pr = nil
-            if has_key(data.hourly, "precipitation") { pr = data.hourly.precipitation[j] }
-            let ap = nil
-            if has_key(data.hourly, "apparent_temperature") { ap = data.hourly.apparent_temperature[j] }
-            let ws = nil
-            if has_key(data.hourly, "wind_speed_10m") { ws = data.hourly.wind_speed_10m[j] }
-            let uv = nil
-            if has_key(data.hourly, "uv_index") { uv = data.hourly.uv_index[j] }
-            hall.push({ds: pt[0] h: hh t: data.hourly.temperature_2m[j] p: data.hourly.precipitation_probability[j] pr: pr ap: ap ws: ws uv: uv})
-        }
-    }
-    let hours = []
-    let prefix = hour_prefix(ctm)
-    let start = -1
-    if prefix != "" {
-        for i in hall.len() {
-            if hall[i].ds + "T" + hall[i].h + ":" == prefix { start = i break }
-        }
-    }
-    if start < 0 && hall.len() > 0 { start = 0 }
-    if start >= 0 {
-        for k in 24 {
-            let j = start + k
-            if j >= hall.len() { break }
-            hours.push({h: hall[j].h t: hall[j].t p: hall[j].p})
+            hours.push({h: hh t: data.hourly.temperature_2m[j] p: data.hourly.precipitation_probability[j]})
         }
     }
     let days = []
@@ -257,7 +229,7 @@ fn parse_forecast(body){
     let hi = nil
     let lo = nil
     if days.len() > 0 { hi = days[0].hi lo = days[0].lo }
-    return {temp: data.current.temperature_2m code: data.current.weather_code time: ctm hi: hi lo: lo hours: hours hall: hall days: days}
+    return {temp: data.current.temperature_2m code: data.current.weather_code time: ctm hi: hi lo: lo hours: hours days: days}
 }
 
 // 15 秒超时:到点仍无响应 → 作废这轮,保留上次成功数据并提示
@@ -744,11 +716,8 @@ fn split_multi_place(p){
             let parts = p.split(sep)
             if parts.len() >= 2 {
                 let first = parts[0].trim()
-                let rest = parts[1].trim()
-                for st in ["看日出","看日落","看海","逛街","游泳","骑车","骑行","爬山","跑步","徒步","露营","野餐","散步","拍照","玩水","钓鱼","放风筝"] {
-                    let suf = rest.strip_suffix(st)
-                    if suf != nil && suf != rest { rest = suf break }
-                }
+                // #37-2: 复用单遍截断(原来对 17 个活动词逐一 strip_suffix)
+                let rest = cut_at_activity(parts[1].trim())
                 if first != "" && rest != "" { return {first: first extra: rest} }
             }
         }
@@ -756,38 +725,36 @@ fn split_multi_place(p){
     return {first: p extra: ""}
 }
 
+// #37-2: 单遍截断——在最早出现的活动词处截断(替代 strip_suffix×词表×多轮循环)。
+// 返回截断后的串;没有活动词则原样返回。
+fn cut_at_activity(s){
+    let stops = ["看日出","看日落","看海","逛街","游泳","骑车","骑行","爬山","跑步","徒步","露营","野餐","散步","拍照","玩水","钓鱼","放风筝"]
+    let cut = -1
+    let win = ""
+    for st in stops {
+        let i = s.search(st)
+        if i >= 0 && (cut < 0 || i < cut) { cut = i win = st }
+    }
+    if cut < 0 { return s }
+    return s.split(win)[0]
+}
+
 fn parse_place(text){
     let i = text.search("去")
     if i < 0 { return "" }
-    // 「去」之后到第一个活动词/句尾
-    let stops = ["看日出","看日落","看海","逛街","游泳","骑车","骑行","爬山","跑步","徒步","露营","野餐","散步","拍照","玩水","钓鱼","放风筝"]
-    // 兜底:地点 2-4 字,遇常见动词字截断(放/看/吃/玩/逛/跑/骑/爬/拍/钓)
-    let verbs = ["放","看","吃","玩","逛","跑","骑","爬","拍","钓"]
+    // #37-2: 16 个活动词合成一个交替正则(原来每词编译+exec 一次);
+    // 捕获 = 「去」之后到第一个活动词前的片段
+    let m = regex("去([一-龥A-Za-z0-9]+)(看日出|看日落|看海|逛街|游泳|骑车|骑行|爬山|跑步|徒步|露营|野餐|散步|拍照|玩水|钓鱼|放风筝)", "").exec(text)
     let tail = text
-    for st in stops {
-        let m = regex("去([一-龥A-Za-z0-9]+)" + st, "").exec(text)
-        if m != nil && m.captures.len() >= 2 { tail = m.captures[1] break }
-    }
+    if m != nil && m.captures.len() >= 2 { tail = m.captures[1] }
     if tail == text {
         let m2 = regex("去([一-龥A-Za-z0-9]+)", "").exec(text)
         if m2 != nil && m2.captures.len() >= 2 { tail = m2.captures[1] }
     }
-    // 尾部剥离残留活动词(「大梅沙游泳」→「大梅沙」;多轮防「玩」类单字循环)
-    let again = true
-    let guard_n = 0
-    while again && guard_n < 6 {
-        again = false
-        guard_n = guard_n + 1
-        for st in stops {
-            let suf = tail.strip_suffix(st)
-            if suf != nil && suf != tail {
-                tail = suf
-                again = true
-                break
-            }
-        }
-    }
+    // 兜底:无活动词命中时,尾部残留活动词在最早活动词处截断(「大梅沙游泳」→「大梅沙」)
+    tail = cut_at_activity(tail)
     // 动词字兜底(#26-5):从 tail 第一个常见动词字起截断(「莲花山放风筝」→「莲花山」)
+    let verbs = ["放","看","吃","玩","逛","跑","骑","爬","拍","钓"]
     let cut = -1
     let win_v = ""
     for v in verbs {
@@ -843,48 +810,101 @@ fn geo_one(q){
     return nil
 }
 
-// g_assess 的取数前置:定位 → (必要时)取该点预报 → 缓存到 g_wx_place/g_wx_guard
+// g_assess 的取数前置:定位 → (必要时)取该点计划窗预报 → 缓存到 g_wx_guard
 let g_wx_guard = nil   // 守护页专用预报(地点定位后)
-let g_wx_guard_key = ""  // "lat,lon" 缓存键
+let g_wx_guard_key = ""  // "lat,lon,date" 缓存键(#37-2: 计划日变了要重取)
 
 fn guard_fetch_for(place){
     let p = geo_one(place)
     if p == nil {
         g_geo = nil
-        g_geo_note = "没找到「" + place + "」,按当前城市〈" + cities[cur].name + "〉的预报"
-        g_wx_guard = nil
-        g_wx_guard_key = ""
+        // #37-2: 首页 hall 已瘦身为 24h——回退当前城市也要主动取计划窗
+        let ok = guard_fetch_ll(cities[cur].lat, cities[cur].lon, cities[cur].name, "")
+        if ok { g_geo_note = "没找到「" + place + "」,按当前城市〈" + cities[cur].name + "〉的预报" }
         return
     }
-    let key = "" + p.lat + "," + p.lon
     g_geo = p
-    g_geo_note = "按〈" + p.name + " · " + p.label + "〉的预报"
-    if key != g_wx_guard_key {
-        g_wx_guard_key = key
-        let url = "https://api.open-meteo.com/v1/forecast?latitude=" + p.lat + "&longitude=" + p.lon
-            + "&current=temperature_2m,weather_code"
-            + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
-            + "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"
-            + "&timezone=auto&forecast_days=16"
-        let res = fetch(url).await()
-        if res == nil || res.status_code >= 400 {
-            g_wx_guard = nil
-            g_wx_guard_key = ""
-            g_geo_note = "按〈" + p.name + " · " + p.label + "〉取数失败,稍后再试"
-            return
-        }
-        g_wx_guard = parse_forecast(res.body.to_string())
-        if g_wx_guard == nil {
-            g_wx_guard_key = ""
-            g_geo_note = "按〈" + p.name + " · " + p.label + "〉数据解析失败,稍后再试"
-        }
-    }
+    let ok2 = guard_fetch_ll(p.lat, p.lon, p.name + " · ", p.label)
+    if ok2 { g_geo_note = "按〈" + p.name + " · " + p.label + "〉的预报" }
 }
 
-// 守护页取当前生效的预报(wx 代理)
+// #37-2: 守护窗取数函数——只取计划日(含)+5 天的逐小时,不再解析 16 天。
+// 返回 true=取到;false=失败(g_geo_note 已写失败原因)。
+fn guard_fetch_ll(lat, lon, pname, plabel){
+    let key = "" + lat + "," + lon + "," + g_date
+    if key == g_wx_guard_key { return true }
+    g_wx_guard_key = key
+    let url = guard_url_for(lat, lon, g_date)
+    let res = fetch(url).await()
+    if res == nil || res.status_code >= 400 {
+        g_wx_guard = nil
+        g_wx_guard_key = ""
+        g_geo_note = "按〈" + pname + plabel + "〉取数失败,稍后再试"
+        return false
+    }
+    let w = parse_forecast_guard(res.body.to_string())
+    if w == nil {
+        g_wx_guard = nil
+        g_wx_guard_key = ""
+        g_geo_note = "按〈" + pname + plabel + "〉数据解析失败,稍后再试"
+        return false
+    }
+    g_wx_guard = w
+    return true
+}
+
+// #37-2: start_date/end_date 与 forecast_days 互斥(实测 Cannot mix),窗自算。
+// 起点不早于今天(过去日期 hourly 会回空);上限今天+15(预报可靠范围),
+// 再往后由 g_assess 超窗分支兜底。
+fn guard_url_for(lat, lon, date){
+    let t = today_str()
+    let from = date
+    if t != "" && days_of(date) - days_of(t) < 0.0 { from = t }
+    let to = shift_date(date, 5)
+    if t != "" {
+        let cap = shift_date(t, 15)
+        if days_of(to) - days_of(cap) > 0.0 { to = cap }
+    }
+    return "https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon
+        + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
+        + "&timezone=auto&start_date=" + from + "&end_date=" + to
+}
+
+// #37-2: 守护页专用解析——只建 hall(计划窗 ≤6 天),不建首页的 hours/days;
+// 字段存在性预判一次,循环内不再做 O(n) 的 has_key
+fn parse_forecast_guard(body){
+    let data = body.parse_json()
+    if data == nil { return nil }
+    if !has_key(data, "hourly") || !has_key(data.hourly, "time") { return nil }
+    let ht = data.hourly.time
+    if ht.len() == 0 { return nil }
+    let hp = has_key(data.hourly, "precipitation")
+    let ha = has_key(data.hourly, "apparent_temperature")
+    let hw = has_key(data.hourly, "wind_speed_10m")
+    let hu = has_key(data.hourly, "uv_index")
+    let hall = []
+    for j in ht.len() {
+        let pt = ht[j].split("T")
+        let hh = ""
+        if pt.len() >= 2 { hh = pt[1].split(":")[0] }
+        let pr = nil
+        if hp { pr = data.hourly.precipitation[j] }
+        let ap = nil
+        if ha { ap = data.hourly.apparent_temperature[j] }
+        let ws = nil
+        if hw { ws = data.hourly.wind_speed_10m[j] }
+        let uv = nil
+        if hu { uv = data.hourly.uv_index[j] }
+        hall.push({ds: pt[0] h: hh t: data.hourly.temperature_2m[j] p: data.hourly.precipitation_probability[j] pr: pr ap: ap ws: ws uv: uv})
+    }
+    // time 仅作展示/台账时间用;guard 数据无 current,用窗首日 00:00
+    return {hall: hall time: hall[0].ds + "T00:00"}
+}
+
+// 守护页取当前生效的预报。#37-2: 首页 wx 已无 hall(24h 窗)——守护一律用
+// g_wx_guard(guard_fetch_for 两分支都会主动取计划窗);nil 由调用方按失败处理。
 fn guard_wx(){
-    if g_geo != nil && g_wx_guard != nil { return g_wx_guard }
-    return wx
+    return g_wx_guard
 }
 
 // #35-4/7: 缺项以最终字段为准(空=缺)——agent 忘了写 missing、或字段空,
