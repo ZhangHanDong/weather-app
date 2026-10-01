@@ -1377,6 +1377,7 @@ fn day_level_of(ds, start, dur){
 
 let g_undo_plan = nil      // #29-5: 3 秒内可撤销的删除
 let g_undo_idx = 0
+let g_undo_action_id = ""   // #38-5: 撤销删除时恢复幂等键
 let g_undo_timer = nil
 
 fn plan_row_tap(i){
@@ -1395,6 +1396,9 @@ fn del_plan(i){
     }
     g_undo_idx = i
     g_undo_plan = g_plans[i]
+    // #38-5: 删掉的计划可以重新确认:清掉幂等键(撤销时再恢复)
+    g_undo_action_id = g_last_action_id
+    g_last_action_id = ""
     let kept = []
     for j in g_plans.len() { if j != i { kept.push(g_plans[j]) } }
     g_plans = kept
@@ -1422,6 +1426,7 @@ fn undo_del(){
     if !placed { out.push(g_undo_plan) }
     g_plans = out
     g_undo_plan = nil
+    if g_last_action_id == "" { g_last_action_id = g_undo_action_id }
     save_plans()
     g_note = "已撤销删除"
     render_guard()
