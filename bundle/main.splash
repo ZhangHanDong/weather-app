@@ -1501,6 +1501,7 @@ fn checklist_str(p){
 // ---------- 守护页:导航与渲染 ----------
 
 fn open_guard(){
+    close_panel()           // #38-2: 守护页不带着城市面板
     g_screen = "guard"
     load_plans()
     ui.app_head.set_visible(false)
@@ -2183,6 +2184,10 @@ fn agent_reply(chan, text){
             g_note = "还缺:" + join_list(miss) + ",请在解析卡补上后点评估风险"
         } else {
             g_note = "agent 已解析 · 按「评估风险」继续"
+            // #38-4: 原句没给出具体时刻(没有「点」「:」),agent 填的时间是估计
+            if g_start != "" && g_input.search("点") < 0 && g_input.search(":") < 0 && g_input.search("：") < 0 {
+                g_note = "agent 已解析 · 时间按 " + g_start + " 估计,可在解析卡修改 · 按「评估风险」继续"
+            }
         }
         if place_extra != "" { g_note = g_note + " · 还提到:" + place_extra + "(可在解析卡修改)" }
         render_guard()
@@ -2258,12 +2263,17 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
                 on_return: |text| do_search(text)
                 draw_bg +: {color: #xf2f2f7 color_hover: #xf2f2f7 color_focus: #xf2f2f7 color_empty: #xf2f2f7 border_radius: 18.0}
                 draw_text +: {color: ink color_hover: ink color_focus: ink color_empty: secondary color_empty_hover: secondary}}
+            ButtonFlat{text: "取消" height: 36 padding: Inset{left: 12 right: 12} on_click: || close_panel()
+                draw_bg +: {border_radius: 18.0 color: #xf2f2f7 color_hover: #xe8e8ed color_down: #xdcdce2 border_size: 0.0}
+                draw_text +: {color: ink color_hover: ink color_down: ink}}
             ButtonFlat{text: "搜索" height: 36 padding: Inset{left: 14 right: 14} on_click: || do_search(ui.sbox.text())
                 draw_bg +: {border_radius: 18.0 color: #x007aff color_hover: #x0a84ff color_down: #x0062cc border_size: 0.0}
                 draw_text +: {color: #xffffff color_hover: #xffffff color_down: #xffffff}}
         }
         search_note := Label{width: Fill text: "" draw_text.color: secondary draw_text.text_style.font_size: 11}
         result_rows := View{width: Fill height: Fit flow: Down spacing: 4 on_render: || {
+            // #38-3: on_render 什么都不产出时旧行会留着,空列表也要给一个占位
+            if results.len() == 0 { View{width: Fill height: 0} }
             for h in results {
                 GestureView{width: Fill height: Fit padding: 8 on_tap: |x, y| pick_hit(h)
                     View{width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
@@ -2316,7 +2326,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
         }
     }}
     }
-    }
+    // #38-1: h_days 在 home_page 里面(以前多了一个右括号,把它放到了外面,守护页上会露出 10 天列表)
     h_days := View{visible: false width: Fill height: Fill flow: Down spacing: 10
     days_hdr := Label{width: Fill text: "10 天预报 · 数据来自 Open-Meteo" draw_text.color: secondary draw_text.text_style.font_size: 11}
     days_list := ScrollYView{width: Fill height: Fill flow: Down spacing: 8 on_render: || {
@@ -2331,6 +2341,7 @@ SolidView{width: Fill height: Fill flow: Down padding: 16 spacing: 10 draw_bg.co
             }
         }
     }}
+    }
     }
 // ---------- 守护页(#31 分步:每步 ≤~420px,不依赖宿主滚动) ----------
     guard_page := View{visible: false width: Fill height: Fill flow: Down spacing: 5
