@@ -74,13 +74,19 @@ tools/octo run   /path/to/weather-app/bundle      # 打开窗口
 
 **3. Rinx 小程序**
 
-Rinx 侧栏「Mini apps」→「导入应用」→ 路径填 `bundle/` → Review bundle → Run。Rinx 给小程序的高度约 450px,守护页按四步拆分,每步都放得下。
+`bundle/` 是给 App Hub 的**已签名**版本;Rinx 的本地导入只接受未签名包(会提示 "no signature verifier is installed")。先生成一份未签名副本(代码和素材完全相同,只去掉签名、重新计算摘要):
+
+```sh
+tools/rinx-copy.sh          # 生成 ./rinx-bundle,需要 PATH 里有 hub
+```
+
+然后在 Rinx 侧栏「Mini apps」→「导入应用」→ 路径填 `rinx-bundle` 的绝对路径 → Review bundle → Run。Rinx 给小程序的高度约 450px,守护页按四步拆分,每步都放得下。
 
 ## 验证记录
 
 - `hub check --allow-unsigned`:PASSED(用 2026-10-04 的 App Hub `f801b58` 复核过)。
 - 用 makepad remote 驱动的全量回归,在 OctoSense main + 真 agent 上 24/24 通过,脚本错误 0:首页、城市面板(搜索、候选、切换)、首次同意、5 句解析、缺项、超出预报范围、风险卡、方案逐项校验、确认、幂等、核验、行程簿删除与撤销、台账。
-- 三个宿主都走通过完整流程:card-host 与 OctoSense 用的是当前版本;Rinx 上最近一次完整实测是 `d0e8795`,之后的改动没有涉及 Rinx 特有的布局。在 CPU 负载和 Z.AI 限流(HTTP 429)下验证过不会卡住。
+- 三个宿主都走通过完整流程:card-host、OctoSense 和 Rinx(用 `tools/rinx-copy.sh` 生成的未签名副本,12/12 通过)都是提交版本 `c335426`。在 CPU 负载和 Z.AI 限流(HTTP 429)下验证过不会卡住。
 
 ## 截图
 
