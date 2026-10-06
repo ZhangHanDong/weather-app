@@ -12,19 +12,19 @@
   ],
   "screenshots": [
     "screenshots/01-home.png",
-    "screenshots/02-chaoyang.png",
-    "screenshots/03-risk-options.png",
+    "screenshots/02-cities.png",
+    "screenshots/03-parse.png",
     "screenshots/04-verify.png",
-    "screenshots/05-agent-rejected.png"
+    "screenshots/05-missing.png"
   ],
   "icon": "assets/icon.svg",
   "platforms": [
     "macos"
   ],
   "publisher": {
-    "name": "Replace with your publisher name",
-    "support": "https://example.com/support",
-    "privacy_policy_url": "https://example.com/privacy"
+    "name": "ZhangHanDong",
+    "support": "https://github.com/ZhangHanDong/weather-app/issues",
+    "privacy_policy_url": "https://github.com/ZhangHanDong/weather-app/blob/main/PRIVACY.md"
   },
   "release_notes": "0.1.0:天气首页(24 小时/10 天,15 分钟自动刷新,超时或失败保留上次数据);城市搜索切换(同名候选、找不到提示);行程守护——中文一句话解析(今天/明天/后天/周X/下周X/M月D日、N点半、一个半小时、今晚/明早等),五因子风险卡(阈值固定并附数据时间),四类方案(改期扫 5 天/室内/携带词表/保持),确认执行+台账+重验(改期核验新时段,携带核验读回,风险仍高另行提醒),幂等不重复执行;助手通路(octos)可选,回复校验不合格自动回退规则并说明原因;执行失败可重试;删除 3 秒内可撤销;城市/行程簿/台账重启保留。",
   "age_rating": "all",

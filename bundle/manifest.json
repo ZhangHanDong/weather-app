@@ -1,13 +1,22 @@
 {
+  "agent": null,
   "capabilities": [
     "net",
     "storage",
     "octos.session.open",
     "octos.turn.start"
   ],
+  "compute": {
+    "instruction_budget": null,
+    "memory_bytes": null
+  },
   "id": "trip-guardian",
   "integrity": {
-    "bundle_blake3": "e2446b0d491b2c7d2bd3c988b475f8fca4a179a680f1dc227b8d1d19fd7c20c8"
+    "bundle_blake3": "e2974304249fac7370f168341c9235edb07a1f5342fd37d16e5fc5509f0ebe57",
+    "signature": {
+      "key_id": "zhanghandong",
+      "value": "0d7a264db5b8cf8d853c20a9d31c3c2368ad04e56ebea56a5b3e7f6f8f30869f16cd509ace1a58efa27fef05d9580c8dddb3c18651fa7e12f7c4931b037c240d"
+    }
   },
   "name": "行程天气",
   "network": {
@@ -17,5 +26,8 @@
     ]
   },
   "schema": 1,
+  "storage": {
+    "max_bytes": null
+  },
   "version": "0.1.0"
 }

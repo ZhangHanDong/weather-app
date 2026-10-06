@@ -84,16 +84,17 @@ Rinx 侧栏「Mini apps」→「导入应用」→ 路径填 `bundle/` → Revie
 
 ## 截图
 
-| 首页 | 同名地点候选 | 风险与方案 | 核验 | agent 回复被拒后回退 |
+| 首页 | 同名地点候选 | 解析卡 | 核验通过 | 缺项提示(失败状态) |
 |---|---|---|---|---|
-| ![](bundle/screenshots/01-home.png) | ![](bundle/screenshots/02-chaoyang.png) | ![](bundle/screenshots/03-risk-options.png) | ![](bundle/screenshots/04-verify.png) | ![](bundle/screenshots/05-agent-rejected.png) |
+| ![](bundle/screenshots/01-home.png) | ![](bundle/screenshots/02-cities.png) | ![](bundle/screenshots/03-parse.png) | ![](bundle/screenshots/04-verify.png) | ![](bundle/screenshots/05-missing.png) |
 
 ## 已知限制
 
 - 模型服务商限流时,agent 那一步可能要 40 秒以上;期间先显示规则结果。
 - 两个宿主之间不同步数据。
-- 包尚未用发布者密钥签名,也未提交到 App Hub 公共目录。
+- 四步页签里,当前选中的那一步标签显示得很淡(Makepad 按钮在这个版本里的渲染问题,不影响操作)。
+- 已用发布者密钥签名,App Hub 公共目录的收录以审核结果为准。
 
 ## 作者与支持
 
-ZhangHanDong · 问题与建议请在本仓库提 [Issue](https://github.com/ZhangHanDong/weather-app/issues)。
+ZhangHanDong · 问题与建议请在本仓库提 [Issue](https://github.com/ZhangHanDong/weather-app/issues)。隐私说明见 [PRIVACY.md](PRIVACY.md)。
