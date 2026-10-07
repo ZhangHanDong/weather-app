@@ -858,7 +858,8 @@ fn guard_fetch_ll(lat, lon, pname, plabel){
 }
 
 // #37-2: start_date/end_date 与 forecast_days 互斥(实测 Cannot mix),窗自算。
-// 起点不早于今天(过去日期 hourly 会回空);上限今天+15(预报可靠范围),
+// 起点不早于今天(过去日期 hourly 会回空);上限今天+14:Open-Meteo 按 UTC 日期算范围(北京时间 0–8 点时
+// UTC 还是前一天,+15 会越界 4xx),+14 全天都在范围内,
 // 再往后由 g_assess 超窗分支兜底。
 fn guard_url_for(lat, lon, date){
     let t = today_str()
@@ -866,15 +867,16 @@ fn guard_url_for(lat, lon, date){
     if t != "" && days_of(date) - days_of(t) < 0.0 { from = t }
     let to = shift_date(date, 5)
     if t != "" {
-        let cap = shift_date(t, 15)
+        let cap = shift_date(t, 14)
         if days_of(to) - days_of(cap) > 0.0 { to = cap }
-        // 自审修复:超窗(计划日 > 今天+15)时 from 也要夹进窗内——
+        // 自审修复:超窗(计划日 > 今天+14)时 from 也要夹进窗内——
         // start_date>end_date 会 4xx,被误报成「取数失败」;夹住后 hall 无该日
         // 数据,自然走 g_assess 的超窗分支(「超出预报范围」)
         if days_of(from) - days_of(to) > 0.0 { from = to }
     }
     return "https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon
         + "&hourly=temperature_2m,precipitation_probability,precipitation,apparent_temperature,wind_speed_10m,uv_index"
+        + "&current=temperature_2m"
         + "&timezone=auto&start_date=" + from + "&end_date=" + to
 }
 
@@ -905,8 +907,10 @@ fn parse_forecast_guard(body){
         if hu { uv = data.hourly.uv_index[j] }
         hall.push({ds: pt[0] h: hh t: data.hourly.temperature_2m[j] p: data.hourly.precipitation_probability[j] pr: pr ap: ap ws: ws uv: uv})
     }
-    // time 仅作展示/台账时间用;guard 数据无 current,用窗首日 00:00
-    return {hall: hall time: hall[0].ds + "T00:00"}
+    // 数据时间:评估地点的 current.time(当地时间,timezone=auto);缺失时退回窗首日 00:00
+    let dt = hall[0].ds + "T00:00"
+    if has_key(data, "current") && has_key(data.current, "time") { dt = "" + data.current.time }
+    return {hall: hall time: dt}
 }
 
 // 守护页取当前生效的预报。#37-2: 首页 wx 已无 hall(24h 窗)——守护一律用
@@ -955,7 +959,7 @@ fn g_assess(){
         }
     }
     if rows.len() == 0 {
-        // 该日期无逐小时数据 → 超窗(预报只到今天+15 天)
+        // 该日期无逐小时数据 → 超窗(预报只取到今天+14 天)
         g_no_forecast = gap_days_str(g_date) + "后的天气还没有可靠预报"
         g_risk_level = ""
         g_risk_line = ""
@@ -986,7 +990,7 @@ fn g_assess(){
     g_step = 2
     g_risk_level = level
     g_risk_line = hit_line(rows, hits)
-    g_risk_src = "Open-Meteo · 数据时间 " + fmt_dt(wx.time)
+    g_risk_src = "Open-Meteo · 数据时间 " + fmt_dt(guard_wx().time)   // 被评估那份预报的时间
     g_facts_ok = true
     g_stage = 2
     if g_agent_state == 2 {
@@ -1009,7 +1013,7 @@ fn g_assess(){
         if day_level(cand) != "高" { next_t = cand break }
     }
     if next_t != "" { resched_hint = "。若建议改期,目标日期是 " + next_t + "(" + short_date(next_t) + " 同一时段)" }
-    let prompt = "计划窗口风险等级:" + level + "。事实(窗内最差值,数据时间 " + fmt_dt(wx.time) + "):" + g_risk_line + resched_hint + "。请只回 JSON:{options:[{action,why,checklist[]}]},1-3 项;action 只能是 reschedule/mark_indoor/add_checklist/keep 之一;checklist 只能来自 [雨具,补水,保暖衣物,防晒];why 里的每个数字必须来自上面事实;不得含 URL。"
+    let prompt = "计划窗口风险等级:" + level + "。事实(窗内最差值,数据时间 " + fmt_dt(guard_wx().time) + "):" + g_risk_line + resched_hint + "。请只回 JSON:{options:[{action,why,checklist[]}]},1-3 项;action 只能是 reschedule/mark_indoor/add_checklist/keep 之一;checklist 只能来自 [雨具,补水,保暖衣物,防晒];why 里的每个数字必须来自上面事实;不得含 URL。"
     agent_ask("options", prompt)
 }
 
@@ -1127,6 +1131,7 @@ fn day_level(ds){
                 elif r.ap != nil && r.ap >= 32.0 { if lv == "低" { lv = "中" } }
                 if r.ws != nil && r.ws >= 38.0 { lv = "高" }
                 elif r.ws != nil && r.ws >= 28.0 { if lv == "低" { lv = "中" } }
+                if r.uv != nil && r.uv >= 8.0 { if lv == "低" { lv = "中" } }   // 与风险卡一致:UV 最多到中
                 break
             }
         }
@@ -1273,7 +1278,11 @@ fn g_confirm(){
         render_guard()
         return
     }
-    let plan = {id: "p" + time_now() place: g_place date: g_date start: g_start dur: g_dur indoor: false rescheduled: false checklist: [] done: false}
+    // 计划记下评估用的坐标(地点定位到 → g_geo;否则当前城市),核验按它重新取数
+    let lat = cities[cur].lat
+    let lon = cities[cur].lon
+    if g_geo != nil { lat = g_geo.lat lon = g_geo.lon }
+    let plan = {id: "p" + time_now() place: g_place lat: lat lon: lon date: g_date start: g_start dur: g_dur indoor: false rescheduled: false checklist: [] done: false}
     let after = apply_action(plan, opt)
     g_plans.push(after)
     // #28-4: 持久化失败 → 不记成功台账,给原因,可重试(再点确认)
@@ -1307,11 +1316,39 @@ fn plan_key(opt){
 }
 
 // 核验:重新拉取当前城市预报,读回行程簿最后一条,比对 + 改期新窗非高
+// 核验时真的重新取数(不用缓存):按计划自己记下的坐标和日期再取一次
+// (0.1.1 之前保存的计划没有坐标,退回本次会话的定位/当前城市)
+fn verify_fetch(p){
+    g_wx_guard_key = ""
+    let lat = cities[cur].lat
+    let lon = cities[cur].lon
+    if has_key(p, "lat") && p.lat != nil { lat = p.lat lon = p.lon }
+    elif g_geo != nil { lat = g_geo.lat lon = g_geo.lon }
+    let key = "" + lat + "," + lon + "," + p.date
+    let res = fetch(guard_url_for(lat, lon, p.date)).await()
+    if res == nil || res.status_code >= 400 { return false }
+    let w = parse_forecast_guard(res.body.to_string())
+    if w == nil { return false }
+    g_wx_guard = w
+    g_wx_guard_key = key
+    return true
+}
+
 fn g_verify(){
     if g_stage != 3 { return }
     if wx == nil { g_note = "数据未就绪" render_guard() return }
+    if g_plans.len() == 0 { g_note = "行程簿是空的,没有可核验的计划" render_guard() return }
     let p = g_plans[g_plans.len()-1]
+    g_note = "正在重新取数核验…"
+    render_guard()
+    if !verify_fetch(p) {
+        g_note = "核验时取数失败,稍后再点「核验」重试"
+        g_verify_line = "核验未完成 · 重新取数失败"
+        render_guard()
+        return
+    }
     let lv = day_level_of(p.date, p.start, p.dur)
+    let vtime = fmt_dt(guard_wx().time)
     let readback = p.place + " " + short_date(p.date) + " " + p.start
     let verdict = ""
     // #27-2: 「新时段不是高风险」只用于改期(reschedule)。室内/携带/保持
@@ -1345,7 +1382,8 @@ fn g_verify(){
     }
     // #25-8:核验也记台账(kind=verify,结果+原因+数据时间)
     let seq = ledger_seq()
-    g_ledger.push({seq: seq at: fmt_dt(wx.time) kind: "verify" action_id: "verify:" + p.id detail: "核验" + verdict + ";读回 " + p.place + " " + p.date + " " + p.start + ";数据时间 " + fmt_dt(wx.time)})
+    g_verify_line = g_verify_line + "\n重新取数 · 数据时间 " + vtime
+    g_ledger.push({seq: seq at: fmt_dt(wx.time) kind: "verify" action_id: "verify:" + p.id detail: "核验" + verdict + ";读回 " + p.place + " " + p.date + " " + p.start + ";重新取数,数据时间 " + vtime})
     save_ledger()
     render_guard()
 }
@@ -1368,6 +1406,7 @@ fn day_level_of(ds, start, dur){
                 elif r.ap != nil && r.ap >= 32.0 { if lv == "低" { lv = "中" } }
                 if r.ws != nil && r.ws >= 38.0 { lv = "高" }
                 elif r.ws != nil && r.ws >= 28.0 { if lv == "低" { lv = "中" } }
+                if r.uv != nil && r.uv >= 8.0 { if lv == "低" { lv = "中" } }   // 与风险卡一致:UV 最多到中
                 break
             }
         }
@@ -1662,7 +1701,7 @@ fn agent_allow_note(chan){
     return "OctoSense 正在询问是否允许行程天气使用助手;在弹窗里点 Allow 后,再点一次「" + retry + "」"
 }
 
-// #36-5: 宿主立即错误按原因写白话;「没及时回复」只留给 30 秒看门狗(agent_timeout)
+// #36-5: 宿主立即错误按原因写白话;「没及时回复」只留给 90 秒看门狗(agent_timeout)
 fn agent_err_note(err, chan){
     if agent_wait_allow(err) { return agent_allow_note(chan) }
     return "助手暂时启动不了,已按规则处理"
@@ -1727,7 +1766,7 @@ fn agent_busy_show(){
     }
 }
 
-// 30 秒看门狗(#26-6 → #35-2 → #37-1):只回退这一次,不关整个会话的 agent。
+// 90 秒看门狗(#26-6 → #35-2 → #37-1):只回退这一次,不关整个会话的 agent。
 // #37-1 后它同时兜两种情形:回调一直没来(超时)/回调来了但处理函数被硬时间
 // 预算掐断(pending 仍在)——到点一律按规则结果恢复可操作,并写台账。
 fn agent_timeout(){
@@ -2073,8 +2112,10 @@ fn agent_opts_to_g(opts){
     }
     if next != "" { resched_label = "改期到 " + short_date(next) + " " + g_start }
     for i op in opts {
-        let label = op.why
-        if op.action == "reschedule" && resched_label != "" { label = resched_label }
+        // 标签只由代码生成:改期找不到非高风险的目标日时,丢弃该项(不让模型文字决定执行参数)
+        if op.action == "reschedule" && resched_label == "" { continue }
+        let label = ""
+        if op.action == "reschedule" { label = resched_label }
         if op.action == "mark_indoor" { label = "改为室内" }
         if op.action == "keep" { label = "保持原计划" }
         if op.action == "add_checklist" {
@@ -2085,7 +2126,7 @@ fn agent_opts_to_g(opts){
             }
             label = "携带:" + items
         }
-        out.push({id: ids[i] act: op.action label: label why: op.why})
+        out.push({id: ids[out.len()] act: op.action label: label why: op.why})
     }
     return out
 }
