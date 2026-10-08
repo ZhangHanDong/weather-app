@@ -2,7 +2,7 @@
 
 看天气,守护每一次出行。一个 [Octoscript](https://github.com/OctoSense-org/OctoScript-App-Design-Flow) 脚本应用:同一个包可以装进 OctoSense 的 Card runner(经 App Hub 安装),也可以导入 Rinx 小程序宿主运行。
 
-- 应用 id:`trip-guardian`,版本 `0.1.1`
+- 应用 id:`trip-guardian`,版本 `0.1.2`
 - 许可证:Apache-2.0(见 `LICENSE`)
 - 源码:`bundle/`(`manifest.json`、`listing.json`、`main.splash`、`assets/`、`screenshots/`)
 
@@ -75,13 +75,13 @@ tools/octo run   /path/to/weather-app/bundle      # 打开窗口
 
 **3. Rinx 小程序**
 
-`bundle/` 是给 App Hub 的**已签名**版本;Rinx 的本地导入只接受未签名包(会提示 "no signature verifier is installed")。先生成一份未签名副本(代码和素材完全相同,只去掉签名、重新计算摘要):
+从 0.1.2 起,仓库里的 `bundle/` 是未签名的开发版本,可以直接导入 Rinx(Rinx 的本地导入只接受未签名包)。`tools/rinx-copy.sh` 仍可用来生成一份独立副本:
 
 ```sh
 tools/rinx-copy.sh          # 生成 ./rinx-bundle,需要 PATH 里有 hub
 ```
 
-然后在 Rinx 侧栏「Mini apps」→「导入应用」→ 路径填 `rinx-bundle` 的绝对路径 → Review bundle → Run。Rinx 给小程序的高度约 450px,守护页按四步拆分,每步都放得下。
+然后在 Rinx 侧栏「Mini apps」→「导入应用」→ 路径填 `bundle`(或 `rinx-bundle`)的绝对路径 → Review bundle → Run。Rinx 给小程序的高度约 450px,守护页按四步拆分,每步都放得下。
 
 ## 验证记录
 
@@ -100,7 +100,7 @@ tools/rinx-copy.sh          # 生成 ./rinx-bundle,需要 PATH 里有 hub
 - 模型服务商限流时,agent 那一步可能要 40 秒以上;期间先显示规则结果。
 - 两个宿主之间不同步数据。
 - 四步页签里,当前选中的那一步标签显示得很淡(Makepad 按钮在这个版本里的渲染问题,不影响操作)。
-- 已用发布者密钥签名,App Hub 公共目录的收录以审核结果为准。
+- 从 0.1.2 起改用 GitHub 发布者来源证明:推送 `v<版本>` tag 后,`.github/workflows/publish-app.yml` 在 GitHub Actions 上检查、证明并打包应用,生成 Release(`app.bundle.pack.json` 等),不再使用单独的发布者私钥。安装这种包需要支持 `publisher-github-v1` 的 OctoSense;App Hub 公共目录的收录以审核结果为准。0.1.0、0.1.1 用的是旧的 Ed25519 签名方式。
 
 ## 作者与支持
 

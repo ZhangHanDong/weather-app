@@ -12,11 +12,7 @@
   },
   "id": "trip-guardian",
   "integrity": {
-    "bundle_blake3": "b7318a707cfe4bc63221c0fd5211b0abb17e301d92069153a31503475fd86797",
-    "signature": {
-      "key_id": "zhanghandong",
-      "value": "5faa951a732f8d97ea8dbea2e6d1fbcfa041b3e1d184975c292e7d7a8e84248174e6d4aae4bca213b9006a9844becca9b1242717aff31c43036099a986722b0f"
-    }
+    "bundle_blake3": "a2183884260e1d275e573e04bf6b592ac836acb98c944e50dce75d9d3ccb4a7e"
   },
   "name": "行程天气",
   "network": {
@@ -29,5 +25,5 @@
   "storage": {
     "max_bytes": null
   },
-  "version": "0.1.1"
+  "version": "0.1.2"
 }
